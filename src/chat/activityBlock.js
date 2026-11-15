@@ -1,0 +1,926 @@
+/* exported getAgentState, startSpinner, revealText, finishRunOverview, setActivityAnchor, renderActivityBlock, resetActivityBlocks, renderThinkingBlock, renderSubagentBlock, finalizeSubagentRun */
+/* eslint-disable no-unused-vars */
+'use strict';
+
+// renderMarkdown (de core.js/preload) es global y carga ANTES que este archivo.
+// La declaración var SIN inicializador de abajo NO pisa la función ya definida
+// en core.js (un var hoisted sin valor no reasigna una global existente); solo
+// le da tipo al LSP. Nunca asignar aquí — la implementación real vive en
+// preload.js/core.js y un stub con el mismo nombre la rompería.
+/**
+ * Renderiza markdown a HTML saneado (implementación real en preload.js/core.js).
+ * @type {(md: string, opts?: { streaming?: boolean }) => string}
+ */
+var renderMarkdown;
+
+/**
+ * activityBlock.js — Cambio 2/3 del rediseño "Claude Code + AI Agent + VTuber".
+ *
+ * Bloques de actividad por-tool con el formato de llamada de función:
+ *
+ *   Read(core/planner/AgentLoop.js)                  ok · 180L
+ *   Bash(git status)                                 ok · 32ms
+ *   Edit(core/planner/AgentLoop.js)                  err · no hay match
+ *
+ * Mientras la tool corre, el marcador derecho es '⋮' (faint); al terminar se
+ * reemplaza por 'ok · <timing>' (éxito) o 'err · <motivo>' (fallo). Un clic en
+ * el encabezado despliega el detalle indentado a la izquierda; para
+ * Edit/apply_patch el detalle se pinta como diff coloreado.
+ *
+ * También es el módulo que expone el estado del agente (setAgentState/
+ * getAgentState), el spinner del indicador de "pensando" y el revelado
+ * progresivo de texto — funciones que antes vivían en ui.js, ya no cargado.
+ * Reusa el payload de agent-progress tal cual lo emite AgentLoop (phase, tool,
+ * params, status, result, error) y agentStates (core/behavior) como taxonomía
+ * compartida — no inventa una estructura de datos paralela.
+ */
+
+/**
+ * Evento agent-progress tal cual lo emite AgentLoop (payload crudo).
+ * @typedef {Object} AgentProgress
+ * @property {number} iteration
+ * @property {string} tool
+ * @property {string} phase
+ * @property {string} [status]
+ * @property {Record<string, *>} [params]
+ * @property {*} [result]
+ * @property {*} [error]
+ * @property {Record<string, *>|null} [meta] - datos extra de la tool (p. ej.
+ *   oldContent/newContent de edit/apply_patch) para vistas enriquecidas.
+ */
+
+// ── Estado del agente ───────────────────────────────────────────────────────
+const AGENT_STATES = [
+  'idle',
+  'listening',
+  'thinking',
+  'working',
+  'streaming',
+  'speaking',
+  'done',
+  'error',
+];
+let _currentAgentState = 'idle';
+const _stateListeners = new Set();
+
+/**
+ * Actualiza el estado del agente en UI (dataset del body) y notifica a los
+ * listeners registrados (gestos del avatar, etc.). Ya no pinta texto de
+ * estado (#agent-status se eliminó del panel del modelo).
+ * @param {string} state - uno de AGENT_STATES ('idle', 'thinking', 'working', ...)
+ * @param {string} [label] - etiqueta informativa para los listeners
+ * @returns {string}
+ */
+function setAgentState(state, label) {
+  if (!AGENT_STATES.includes(state)) state = 'idle';
+  _currentAgentState = state;
+  document.body.dataset.agentState = state;
+  const status = document.getElementById('composer-status');
+  if (status) {
+    const waiting = document.body.dataset.awaitingPermission === 'true';
+    const text = waiting
+      ? window.kaoruI18n.t('waitingPermission')
+      : label ||
+        {
+          idle: window.kaoruI18n.t('ready'),
+          thinking: window.kaoruI18n.t('thinking'),
+          working: window.kaoruI18n.t('executing'),
+          streaming: window.kaoruI18n.t('responding'),
+          listening: window.kaoruI18n.t('listening'),
+          speaking: window.kaoruI18n.t('speaking'),
+          done: window.kaoruI18n.t('ready'),
+          error: window.kaoruI18n.t('errorLabel'),
+        }[state];
+    if (status.textContent !== text) status.textContent = text || window.kaoruI18n.t('ready');
+    status.dataset.state = waiting ? 'waiting' : state;
+  }
+  _stateListeners.forEach((fn) => fn(state, label));
+  return state;
+}
+
+function getAgentState() {
+  return _currentAgentState;
+}
+
+// ── Spinner (indicador "pensando") ──────────────────────────────────────────
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/**
+ * Anima el indicador "pensando" con frames braille hasta que el elemento deja
+ * de estar conectado. Devuelve el id del interval para poder limpiarlo.
+ * @param {HTMLElement | null} el
+ * @returns {ReturnType<typeof setInterval>}
+ */
+function startSpinner(el) {
+  let i = 0;
+  const interval = setInterval(() => {
+    if (!el || !el.isConnected) {
+      clearInterval(interval);
+      return;
+    }
+    el.textContent = SPINNER_FRAMES[i++ % SPINNER_FRAMES.length];
+  }, 90);
+  return interval;
+}
+
+// ── Revelado de texto progresivo (typewriter por rAF) ───────────────────────
+// Escribe text en el elemento con un cursor parpadeante. Devuelve { done, stop }.
+// Al terminar elimina el cursor; el llamador decide si renderiza markdown.
+/**
+ * @param {HTMLElement} el - contenedor del texto (debe estar en el DOM)
+ * @param {string} text
+ * @param {{ step?: number, markdown?: boolean, gestures?: Array<{ pos: number, mood: string }>, onGesture?: (mood: string) => void }} [opts] - caracteres por frame
+ *   (default: ~500/frame). Con markdown:true el texto se renderiza con
+ *   renderMarkdown de forma progresiva (throttle ~60ms) en lugar de texto
+ *   plano, para que el markdown no se vea en crudo mientras se escribe.
+ *   Con gestures se disparan los marcadores (gesto: x) en vivo cuando el
+ *   cursor revelado los alcanza, llamando a onGesture(mood).
+ */
+function revealText(el, text, opts = {}) {
+  let i = 0;
+  let raf = 0;
+  let stopped = false;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let mdTimer = null;
+  const isMd = !!opts.markdown;
+  const max = String(text || '').length;
+  const step = opts.step || Math.max(1, Math.round(max / 500));
+  const cursor = document.createElement('span');
+  cursor.className = 'stream-cursor';
+  el.textContent = '';
+  el.appendChild(cursor);
+  /** @type {(value?: void | PromiseLike<void>) => void} */
+  let doneResolve = () => {};
+  const done = new Promise((r) => {
+    doneResolve = r;
+  });
+  // Gestos del LLM: markers[{ pos, mood }] se disparan en vivo cuando el cursor
+  // revelado los alcanza, una sola vez cada uno (se van consumiendo).
+  const gestures = (opts.gestures || []).slice().sort((a, b) => a.pos - b.pos);
+  const onGesture = opts.onGesture || null;
+  const fireGesturesUpTo = (/** @type {number} */ idx) => {
+    if (!onGesture || !gestures.length) return;
+    while (gestures.length && gestures[0].pos <= idx) {
+      /** @type {{ pos: number, mood: string }} */
+      const g = /** @type {{ pos: number, mood: string }} */ (gestures.shift());
+      try {
+        onGesture(g.mood);
+      } catch (e) {
+        console.warn('[gesto] onGesture falló:', /** @type {Error} */ (e).message);
+      }
+    }
+  };
+  const paint = () => {
+    fireGesturesUpTo(i);
+    if (isMd) {
+      el.innerHTML = renderMarkdown(String(text).slice(0, i), { streaming: true });
+      el.appendChild(cursor);
+    } else {
+      el.textContent = String(text).slice(0, i);
+      el.appendChild(cursor);
+    }
+    _scrollFeed();
+  };
+  const tick = () => {
+    if (stopped) return;
+    i = Math.min(i + step, max);
+    if (isMd) {
+      if (!mdTimer) {
+        mdTimer = setTimeout(() => {
+          mdTimer = null;
+          paint();
+        }, 60);
+      }
+    } else {
+      paint();
+    }
+    if (i < max) {
+      raf = requestAnimationFrame(tick);
+    } else {
+      if (mdTimer) {
+        clearTimeout(mdTimer);
+        mdTimer = null;
+      }
+      fireGesturesUpTo(max);
+      paint();
+      cursor.remove();
+      doneResolve();
+    }
+  };
+  raf = requestAnimationFrame(tick);
+  return {
+    done,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      if (raf) cancelAnimationFrame(raf);
+      if (mdTimer) {
+        clearTimeout(mdTimer);
+        mdTimer = null;
+      }
+      fireGesturesUpTo(max);
+      if (cursor.parentNode) cursor.remove();
+      doneResolve();
+    },
+  };
+}
+
+function _scrollFeed() {
+  const el = document.getElementById('messages');
+  if (el) el.scrollTop = el.scrollHeight;
+}
+
+// ── Bloques de actividad ────────────────────────────────────────────────────
+// key: `${iteration}:${tool}` → { el, startedAt }
+const _blocks = new Map();
+// Los bloques se insertan ANTES de _activityAnchor (el bubble del asistente en
+// curso) para que el log de tools quede encima de la respuesta en streaming.
+/** @type {HTMLElement | null} */
+let _activityAnchor = null;
+/** @type {HTMLDetailsElement | null} */
+let _runOverview = null;
+/** @type {ReturnType<typeof setTimeout> | null} */
+let _runOverviewHideTimer = null;
+/** @type {{steps: Array<string | {description?: string, label?: string}>, done?: number} | null} */
+let _runOverviewPlan = null;
+const _runOverviewState = {
+  started: 0,
+  finished: 0,
+  changed: 0,
+  failed: 0,
+  current: '',
+  terminal: false,
+};
+
+function _refreshRunOverview() {
+  if (!_runOverview) return;
+  const label = _runOverview.querySelector('.run-overview-label');
+  const current = _runOverview.querySelector('.run-overview-current');
+  const changes = _runOverview.querySelector('.run-overview-changes');
+  if (label) {
+    label.textContent = window.kaoruI18n.format('runOverviewLabel', {
+      current: _runOverviewState.current || window.kaoruI18n.t('working'),
+      done: _runOverviewState.finished,
+      total: _runOverviewState.started,
+    });
+  }
+  if (current)
+    current.textContent = _runOverviewState.current || window.kaoruI18n.t('waitingForResult');
+  if (changes) {
+    changes.textContent = window.kaoruI18n.format('changesAndFailures', {
+      changes: _runOverviewState.changed,
+      failures: _runOverviewState.failed,
+    });
+  }
+}
+
+function startRunOverview() {
+  if (_runOverviewHideTimer) clearTimeout(_runOverviewHideTimer);
+  _runOverviewHideTimer = null;
+  _runOverview?.remove();
+  _runOverview = null;
+  _runOverviewPlan = null;
+  Object.assign(_runOverviewState, {
+    started: 0,
+    finished: 0,
+    changed: 0,
+    failed: 0,
+    current: '',
+    terminal: false,
+  });
+}
+
+function _ensureRunOverview() {
+  if (_runOverview) return;
+  const dock = document.getElementById('task-dock');
+  if (!dock) return;
+  const overview = document.createElement('details');
+  overview.className = 'run-overview';
+  overview.innerHTML = `<summary><span class="run-overview-label" role="status" aria-live="polite">${window.kaoruI18n.t('working')}</span><span aria-hidden="true">▾</span></summary>
+    <div class="run-overview-detail"><p>${window.kaoruI18n.t('now')}: <span class="run-overview-current">${window.kaoruI18n.t('waitingForResult')}</span></p>
+    <p class="run-overview-changes">${window.kaoruI18n.format('changesAndFailures', { changes: 0, failures: 0 })}</p>
+    <p>${window.kaoruI18n.t('pending')}: <span class="run-overview-next">${window.kaoruI18n.t('nextStepUndecided')}</span></p></div>`;
+  dock.hidden = false;
+  dock.prepend(overview);
+  overview.addEventListener('toggle', () => {
+    if (!overview.open && _runOverviewState.terminal) _removeRunOverview(overview);
+  });
+  _runOverview = overview;
+  if (_runOverviewPlan) updateRunOverviewPlan(_runOverviewPlan);
+}
+
+/** @param {HTMLDetailsElement} overview */
+function _removeRunOverview(overview) {
+  overview.remove();
+  if (_runOverview === overview) _runOverview = null;
+  const dock = document.getElementById('task-dock');
+  if (dock && !dock.querySelector('.plan-block')) dock.hidden = true;
+}
+
+/** @param {{steps: Array<string | {description?: string, label?: string}>, done?: number}} plan */
+function updateRunOverviewPlan(plan) {
+  _runOverviewPlan = plan;
+  if (!_runOverview || !Array.isArray(plan?.steps)) return;
+  const next = plan.steps[Math.max(0, Number(plan.done) || 0)];
+  const text = typeof next === 'string' ? next : next?.description || next?.label;
+  const el = _runOverview.querySelector('.run-overview-next');
+  if (el)
+    el.textContent = text ? String(text).slice(0, 130) : window.kaoruI18n.t('noPlanStepsLeft');
+}
+
+/** @param {{cancelled?: boolean, error?: unknown, truncated?: boolean}} result */
+function finishRunOverview(result) {
+  if (!_runOverview) return;
+  _runOverviewState.terminal = true;
+  _runOverviewState.current = result?.cancelled
+    ? window.kaoruI18n.t('cancelled')
+    : result?.error || result?.truncated
+      ? window.kaoruI18n.t('interrupted')
+      : window.kaoruI18n.t('completed');
+  _refreshRunOverview();
+  const overview = _runOverview;
+  _runOverviewHideTimer = setTimeout(() => {
+    if (overview.open) return;
+    _removeRunOverview(overview);
+  }, 7000);
+}
+
+// Nombre amigable por tool para el label del bloque (exec → Bash, etc.). Si la
+// tool no está en el mapa se muestra el nombre interno tal cual.
+/** @type {Record<string, string>} */
+const TOOL_LABELS = {
+  exec: window.kaoruI18n.t('toolBash'),
+  run_command: window.kaoruI18n.t('toolBash'),
+  read: window.kaoruI18n.t('toolRead'),
+  read_file: window.kaoruI18n.t('toolRead'),
+  write: window.kaoruI18n.t('toolWrite'),
+  edit: window.kaoruI18n.t('toolEdit'),
+  edit_file: window.kaoruI18n.t('toolEdit'),
+  apply_patch: window.kaoruI18n.t('toolApplyPatch'),
+  grep: window.kaoruI18n.t('toolGrep'),
+  glob: window.kaoruI18n.t('toolGlob'),
+  code_execution: window.kaoruI18n.t('toolPython'),
+  web_search: window.kaoruI18n.t('toolWebSearch'),
+  websearch: window.kaoruI18n.t('toolWebSearch'),
+  webfetch: window.kaoruI18n.t('toolWebFetch'),
+  browser: window.kaoruI18n.t('toolBrowser'),
+  get_diagnostics: window.kaoruI18n.t('toolDiagnostics'),
+  go_to_definition: window.kaoruI18n.t('toolGoToDef'),
+  find_references: window.kaoruI18n.t('toolFindRef'),
+  get_symbols: window.kaoruI18n.t('toolSymbols'),
+  hover: window.kaoruI18n.t('toolHover'),
+  rename: window.kaoruI18n.t('toolRename'),
+  code_actions: window.kaoruI18n.t('toolCodeActions'),
+  git_status: window.kaoruI18n.t('toolGitStatus'),
+  git_diff: window.kaoruI18n.t('toolGitDiff'),
+  git_log: window.kaoruI18n.t('toolGitLog'),
+  git_branch: window.kaoruI18n.t('toolGitBranch'),
+  git_commit: window.kaoruI18n.t('toolGitCommit'),
+  git_push: window.kaoruI18n.t('toolGitPush'),
+  git_stash: window.kaoruI18n.t('toolGitStash'),
+  git_merge: window.kaoruI18n.t('toolGitMerge'),
+  git_rebase: window.kaoruI18n.t('toolGitRebase'),
+  github_repo_info: window.kaoruI18n.t('toolGitHubRepo'),
+  github_issue_list: window.kaoruI18n.t('toolGitHubIssues'),
+  github_issue_create: window.kaoruI18n.t('toolGitHubIssue'),
+  github_issue_comment: window.kaoruI18n.t('toolGitHubComment'),
+  github_issue_close: window.kaoruI18n.t('toolGitHubClose'),
+  github_pr_list: window.kaoruI18n.t('toolGitHubPRs'),
+  github_pr_create: window.kaoruI18n.t('toolGitHubPR'),
+  github_pr_review: window.kaoruI18n.t('toolGitHubReview'),
+  github_actions_status: window.kaoruI18n.t('toolGitHubActions'),
+  subagent: window.kaoruI18n.t('toolSubagent'),
+  task: window.kaoruI18n.t('toolSubagent'),
+  plugin: window.kaoruI18n.t('toolPlugin'),
+};
+
+/**
+ * @param {AgentProgress} progress
+ */
+function _keyFor(progress) {
+  return `${progress.iteration}:${progress.tool}`;
+}
+
+/**
+ * @param {HTMLElement | null} el - bubble del asistente en curso
+ */
+function setActivityAnchor(el) {
+  _activityAnchor = el;
+}
+
+/**
+ * @param {string} s
+ */
+function _escapeHtml(s) {
+  /** @type {Record<string, string>} */
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  return String(s).replace(/[&<>"']/g, (c) => map[c] ?? c);
+}
+
+/**
+ * Argumento principal de la llamada (el que lee la UI).
+ * @param {AgentProgress} progress
+ */
+function _argLabel(progress) {
+  const p = progress.params || {};
+  const target = p.path || p.command || p.url || p.query || p.glob || p.file_path;
+  return target != null ? String(target).slice(0, 60) : '';
+}
+
+/**
+ * Marcador derecho: '⋮' mientras corre; 'ok · <timing>' / 'err · <motivo>'.
+ * @param {AgentProgress} progress
+ * @param {number} startedAt
+ */
+function _timingLabel(progress, startedAt) {
+  if (progress.status !== 'ok') {
+    const reason = progress.error ? String(progress.error).split('\n')[0].slice(0, 60) : 'fallo';
+    return `err · ${reason}`;
+  }
+  const r = progress.result;
+  if (typeof r === 'string' && /^(read|glob|grep|webfetch|web_search)$/i.test(progress.tool)) {
+    return `ok · ${r.split('\n').length}L`;
+  }
+  const elapsed = Date.now() - (startedAt || Date.now());
+  return elapsed >= 1000 ? `ok · ${(elapsed / 1000).toFixed(1)}s` : `ok · ${elapsed}ms`;
+}
+
+// ¿El resultado parece un diff real (Edit/apply_patch)?
+/**
+ * @param {*} result
+ */
+function _looksLikeDiff(result) {
+  if (typeof result !== 'string') return false;
+  const lines = result.split('\n');
+  let add = 0;
+  let del = 0;
+  let ctx = 0;
+  for (const l of lines) {
+    if (l.startsWith('+') && !l.startsWith('+++')) add++;
+    else if (l.startsWith('-') && !l.startsWith('---')) del++;
+    else if (l.trim() && !l.startsWith('@@')) ctx++;
+  }
+  return add + del >= 2 && add + del > ctx;
+}
+
+/**
+ * @param {string} text
+ */
+function _diffHtml(text) {
+  return text
+    .split('\n')
+    .map((l) => {
+      const esc = _escapeHtml(l);
+      if (l.startsWith('+') && !l.startsWith('+++')) return `<span class="diff-add">${esc}</span>`;
+      if (l.startsWith('-') && !l.startsWith('---')) return `<span class="diff-del">${esc}</span>`;
+      if (l.startsWith('@@')) return `<span class="diff-hunk">${esc}</span>`;
+      return `<span class="diff-ctx">${esc}</span>`;
+    })
+    .join('\n');
+}
+
+// ── Frame de código (Write) ─────────────────────────────────────────────────
+// Muestra el código generado en un recuadro con el nombre de archivo y la ruta
+// arriba. Colapsable: por defecto muestra hasta CODE_FRAME_VISIBLE_LINES y un
+// botón "ver todo" que expande el resto.
+const CODE_FRAME_VISIBLE_LINES = 30;
+const CODE_FRAME_MAX_CHARS = 20000;
+
+/**
+ * @param {string} filePath
+ * @returns {string}
+ */
+function _baseName(filePath) {
+  const p = String(filePath || '');
+  return p.split(/[\\/]/).pop() || p;
+}
+
+/**
+ * @param {string} filePath
+ * @param {string} content
+ * @returns {string}
+ */
+function _codeFrameHtml(filePath, content) {
+  const name = _baseName(filePath);
+  const esc = _escapeHtml(content);
+  const totalLines = content.split('\n').length;
+  const needsExpand =
+    totalLines > CODE_FRAME_VISIBLE_LINES || content.length > CODE_FRAME_MAX_CHARS;
+  return (
+    '<div class="activity-code-frame">' +
+    `<div class="activity-code-frame-head">` +
+    `<span class="activity-code-file">${_escapeHtml(name)}</span>` +
+    `<span class="activity-code-path">${_escapeHtml(filePath)}</span>` +
+    `<span class="activity-code-lines">${window.kaoruI18n.format('codeLines', { count: totalLines })}</span>` +
+    `</div>` +
+    `<pre class="activity-code-body${needsExpand ? ' collapsed' : ''}">${esc}</pre>` +
+    (needsExpand
+      ? `<div class="activity-code-toggle" data-collapsed="1">${window.kaoruI18n.t('showAll')}</div>`
+      : '') +
+    '</div>'
+  );
+}
+
+// ── Split viejo/actualizado (Edit/apply_patch) ─────────────────────────────
+// Dos paneles: el archivo antes (izquierda) y después (derecha). Las líneas
+// que se añadieron se marcan en verde y las que se quitaron en rojo, con el
+// número de línea alineado para que el cambio sea visual.
+/**
+ * @param {string} filePath
+ * @param {string} oldContent
+ * @param {string} newContent
+ * @param {number[]} addedLines
+ * @param {number[]} removedLines
+ * @returns {string}
+ */
+function _editSplitHtml(filePath, oldContent, newContent, addedLines, removedLines) {
+  const name = _baseName(filePath);
+  const added = new Set(addedLines || []);
+  const removed = new Set(removedLines || []);
+  /** @param {string} lines @param {Set<number>} mark @returns {string} */
+  const col = (lines, mark) =>
+    lines
+      .split('\n')
+      .map((line, idx) => {
+        const n = idx + 1;
+        const cls = mark.has(n) ? ' changed' : '';
+        return (
+          `<div class="activity-split-line${cls}">` +
+          `<span class="activity-split-num">${n}</span>` +
+          `<span class="activity-split-text">${_escapeHtml(line) || ' '}</span>` +
+          '</div>'
+        );
+      })
+      .join('');
+  return (
+    '<div class="activity-split">' +
+    `<div class="activity-split-head">` +
+    `<span class="activity-code-file">${_escapeHtml(name)}</span>` +
+    `<span class="activity-split-label old">${window.kaoruI18n.t('before')}</span>` +
+    `<span class="activity-split-label new">${window.kaoruI18n.t('after')}</span>` +
+    `</div>` +
+    `<div class="activity-split-cols">` +
+    `<div class="activity-split-col old">${col(oldContent, removed)}</div>` +
+    `<div class="activity-split-col new">${col(newContent, added)}</div>` +
+    '</div>' +
+    '</div>'
+  );
+}
+
+// Detalle expandible del bloque (texto plano, diff coloreado o stdout/stderr).
+/**
+ * @param {AgentProgress} progress
+ */
+function _detailHtml(progress) {
+  if (progress.status !== 'ok') {
+    const msg = progress.error != null ? String(progress.error) : 'Fallo';
+    return `<div class="activity-block-detail">${_escapeHtml(msg.slice(0, 500))}</div>`;
+  }
+  const r = progress.result;
+  if (r == null) return '';
+
+  // Cualquier mutación que incluya el estado anterior y posterior muestra
+  // primero el cambio real, incluidas las escrituras que reemplazan archivos.
+  if (
+    /^(write|edit|apply_patch)$/i.test(progress.tool) &&
+    progress.meta &&
+    typeof progress.meta.oldContent === 'string' &&
+    typeof progress.meta.newContent === 'string'
+  ) {
+    return `<div class="activity-block-detail">${_editSplitHtml(
+      progress.params && (progress.params.path || progress.params.file_path)
+        ? progress.params.path || progress.params.file_path
+        : '',
+      progress.meta.oldContent,
+      progress.meta.newContent,
+      progress.meta.addedLines,
+      progress.meta.removedLines
+    )}</div>`;
+  }
+
+  // Archivo nuevo: todo su contenido aparece como líneas agregadas.
+  if (
+    /^(write)$/i.test(progress.tool) &&
+    progress.params &&
+    typeof progress.params.content === 'string'
+  ) {
+    const content = progress.params.content;
+    return `<div class="activity-block-detail">${_editSplitHtml(
+      progress.params.path || progress.params.file_path || '',
+      '',
+      content,
+      content.split('\n').map((_, index) => index + 1),
+      []
+    )}</div>`;
+  }
+
+  // Resultado de exec ({stdout, stderr, exitCode, ...}): mostrar SOLO el stdout
+  // limpio formateado, el stderr aparte en color de error y el exit code si no
+  // fue 0 — nunca el JSON crudo del objeto.
+  if (typeof r === 'object' && 'stdout' in r) {
+    const stdout = String(r.stdout || '').trim();
+    const stderr = String(r.stderr || '').trim();
+    const exitCode = r.exitCode;
+    let out = '';
+    if (stdout) {
+      out += `<div class="activity-block-exec">${_escapeHtml(stdout.slice(0, 3000))}</div>`;
+    }
+    if (stderr) {
+      out += `<div class="activity-block-stderr">${_escapeHtml(stderr.slice(0, 2000))}</div>`;
+    }
+    if (exitCode != null && exitCode !== 0) {
+      out += `<div class="activity-block-exit">exit ${_escapeHtml(String(exitCode))}</div>`;
+    }
+    if (!out) {
+      out = `<div class="activity-block-exec">${window.kaoruI18n.t('commandNoOutput')}</div>`;
+    }
+    return `<div class="activity-block-detail">${out}</div>`;
+  }
+
+  let text;
+  if (typeof r === 'string') text = r;
+  else {
+    try {
+      text = JSON.stringify(r, null, 2);
+    } catch {
+      text = String(r);
+    }
+  }
+  text = text.slice(0, 3000);
+  if (/^(edit|apply_patch)$/i.test(progress.tool) && _looksLikeDiff(text)) {
+    return `<div class="activity-block-detail"><div class="activity-block-diff">${_diffHtml(text)}</div></div>`;
+  }
+  return `<div class="activity-block-detail">${_escapeHtml(text)}</div>`;
+}
+
+/**
+ * Crea (en 'start') o actualiza (en 'end') el ActivityBlock correspondiente
+ * a un evento de agent-progress, dentro de containerEl.
+ * @param {HTMLElement} containerEl - dónde van los bloques (uno por tool)
+ * @param {AgentProgress} progress
+ */
+function renderActivityBlock(containerEl, progress) {
+  if (!containerEl || !progress || !progress.tool) return;
+  const key = _keyFor(progress);
+
+  if (progress.phase === 'start') {
+    _ensureRunOverview();
+    _runOverviewState.started++;
+    _runOverviewState.current = TOOL_LABELS[progress.tool] || progress.tool;
+    _refreshRunOverview();
+    const block = document.createElement('div');
+    block.className = 'activity-block';
+    const arg = _argLabel(progress);
+    block.innerHTML =
+      '<div class="activity-block-header">' +
+      `<span class="activity-block-tool">${_escapeHtml(TOOL_LABELS[progress.tool] || progress.tool)}</span>` +
+      (arg
+        ? `<span class="activity-block-paren">(</span><span class="activity-block-arg">${_escapeHtml(arg)}</span><span class="activity-block-paren">)</span>`
+        : '') +
+      '<span class="activity-block-status running">⋮</span>' +
+      '</div>';
+
+    const header = block.querySelector('.activity-block-header');
+    if (header) {
+      header.addEventListener('click', () => {
+        const detail = block.querySelector('.activity-block-detail');
+        if (!detail) return;
+        if (detail.hasAttribute('hidden')) detail.removeAttribute('hidden');
+        else detail.setAttribute('hidden', '');
+      });
+    }
+
+    const parent = _activityAnchor ? _activityAnchor.parentNode : containerEl;
+    if (!parent) return;
+    if (_activityAnchor) parent.insertBefore(block, _activityAnchor);
+    else parent.appendChild(block);
+    _blocks.set(key, { el: block, startedAt: Date.now() });
+    _scrollFeed();
+    return;
+  }
+
+  if (progress.phase === 'end') {
+    const entry = _blocks.get(key);
+    if (!entry) return; // llegó 'end' sin 'start' previo — no romper, ignorar
+    _runOverviewState.finished++;
+    if (progress.status !== 'ok') _runOverviewState.failed++;
+    if (
+      progress.status === 'ok' &&
+      /^(write|edit|edit_file|create_file|apply_patch|delete_file|remove_file)$/i.test(
+        progress.tool
+      )
+    ) {
+      _runOverviewState.changed++;
+    }
+    _runOverviewState.current = window.kaoruI18n.t('preparingNextStep');
+    _refreshRunOverview();
+    _blocks.delete(key);
+
+    const status = entry.el.querySelector('.activity-block-status');
+    const label = _timingLabel(progress, entry.startedAt);
+    status.classList.remove('running');
+    status.classList.add(progress.status === 'ok' ? 'ok' : 'err');
+    status.textContent = label;
+
+    const detailHtml = _detailHtml(progress);
+    if (detailHtml) {
+      const detail = document.createElement('div');
+      detail.innerHTML = detailHtml;
+      entry.el.appendChild(detail);
+      // Toggle "Ver todo ▾" de los frames de código: expande/colapsa el <pre>.
+      const toggle = detail.querySelector('.activity-code-toggle');
+      if (toggle) {
+        toggle.addEventListener('click', () => {
+          const body = detail.querySelector('.activity-code-body');
+          if (!body) return;
+          const collapsed = body.classList.toggle('collapsed');
+          toggle.textContent = window.kaoruI18n.t(collapsed ? 'showAll' : 'showLess');
+        });
+      }
+    }
+    _scrollFeed();
+  }
+}
+
+/** Limpia los bloques activos y el ancla (llamar al terminar/cancelar agent-run). */
+function resetActivities() {
+  startRunOverview();
+  _activityAnchor = null;
+  _blocks.clear();
+  _thinkingCount = 0;
+  _subagentRuns.clear();
+}
+
+/** Alias de resetActivities para quien use el nombre antiguo del módulo. */
+function resetActivityBlocks() {
+  resetActivities();
+}
+
+// ── Bloque "razonando" (narración intermedia plegable) ──────────────────────
+// La narración que el LLM streamió en una iteración que terminó en un tool-call
+// se pliega aquí (estilo opencode/Claude Code): header con clic que alterna el
+// cuerpo. Se inserta antes del ancla igual que los activity blocks, por lo que
+// queda justo encima del bloque del tool que la causó.
+let _thinkingCount = 0;
+
+/**
+ * Pliega la narración intermedia de una iteración en un bloque plegable.
+ * @param {string} text
+ */
+function renderThinkingBlock(text) {
+  const body = String(text || '').trim();
+  if (!body) return;
+  _thinkingCount += 1;
+  const block = document.createElement('div');
+  block.className = 'thinking-block';
+  const header = document.createElement('div');
+  header.className = 'thinking-block-header';
+  const label = document.createElement('span');
+  label.className = 'thinking-block-label';
+  label.textContent = `⟳ ${window.kaoruI18n.t('reasoningActivity')}${_thinkingCount > 1 ? ` (${_thinkingCount})` : ''}`;
+  const chevron = document.createElement('span');
+  chevron.className = 'thinking-block-chevron';
+  chevron.textContent = '▸';
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'thinking-block-body';
+  bodyEl.innerHTML = renderMarkdown(body);
+  bodyEl.setAttribute('hidden', '');
+  header.addEventListener('click', () => {
+    if (bodyEl.hasAttribute('hidden')) {
+      bodyEl.removeAttribute('hidden');
+      chevron.textContent = '▾';
+    } else {
+      bodyEl.setAttribute('hidden', '');
+      chevron.textContent = '▸';
+    }
+  });
+  header.appendChild(label);
+  header.appendChild(chevron);
+  block.appendChild(header);
+  block.appendChild(bodyEl);
+  const parent = _activityAnchor ? _activityAnchor.parentNode : null;
+  if (!parent) return;
+  if (_activityAnchor) parent.insertBefore(block, _activityAnchor);
+  else parent.appendChild(block);
+  _scrollFeed();
+}
+
+// ── Bloque de subagente (F4): visibilidad del trabajo delegado ───────────────
+// Cada subagente (por perfil) abre un bloque colapsable al arrancar; los
+// events de su loop anidado (canal agent-subagent-progress) se pintan como
+// líneas indentadas adentro, con el mismo lenguaje visual de los activity
+// blocks. Cierre con finalizeSubagentRun (lo llama ipc.js cuando termina la
+// tool subagent del loop padre).
+/** @type {Map<string, { block: HTMLElement, body: HTMLElement, status: HTMLElement, stepEls: Map<string, HTMLElement> }>} */
+const _subagentRuns = new Map();
+
+/**
+ * Abre el bloque colapsable de un perfil (una vez por run).
+ * @param {string} name
+ */
+function openSubagentRun(name) {
+  if (!name || _subagentRuns.has(name)) return;
+  const block = document.createElement('div');
+  block.className = 'subagent-block';
+  const header = document.createElement('div');
+  header.className = 'subagent-block-header';
+  const label = document.createElement('span');
+  label.className = 'subagent-block-label';
+  label.textContent = `subagent: ${name}`;
+  const chevron = document.createElement('span');
+  chevron.className = 'subagent-block-chevron';
+  chevron.textContent = '▸';
+  const status = document.createElement('span');
+  status.className = 'subagent-block-status running';
+  status.textContent = '⋮';
+  const body = document.createElement('div');
+  body.className = 'subagent-block-body';
+  body.setAttribute('hidden', '');
+  header.addEventListener('click', () => {
+    if (body.hasAttribute('hidden')) {
+      body.removeAttribute('hidden');
+      chevron.textContent = '▾';
+    } else {
+      body.setAttribute('hidden', '');
+      chevron.textContent = '▸';
+    }
+  });
+  header.appendChild(label);
+  header.appendChild(status);
+  header.appendChild(chevron);
+  block.appendChild(header);
+  block.appendChild(body);
+  const parent = _activityAnchor ? _activityAnchor.parentNode : null;
+  if (!parent) return;
+  if (_activityAnchor) parent.insertBefore(block, _activityAnchor);
+  else parent.appendChild(block);
+  _subagentRuns.set(name, { block, body, status, stepEls: new Map() });
+  _scrollFeed();
+}
+
+/**
+ * @param {{ iteration: number, tool: string }} p
+ */
+function _subagentStepKey(p) {
+  return `${p.iteration}:${p.tool}`;
+}
+
+/**
+ * Pinta una línea de actividad del subagente dentro de su bloque.
+ * @param {AgentProgress & { agent?: string }} payload
+ */
+function renderSubagentBlock(payload) {
+  if (!payload || !payload.tool || !payload.agent) return;
+  if (!_subagentRuns.has(payload.agent)) openSubagentRun(payload.agent);
+  const run = _subagentRuns.get(payload.agent);
+  if (!run) return;
+  const key = _subagentStepKey(payload);
+
+  if (payload.phase === 'start') {
+    const line = document.createElement('div');
+    line.className = 'subagent-step';
+    const arg = _argLabel(payload);
+    line.innerHTML =
+      `<span class="subagent-step-tool">${_escapeHtml(TOOL_LABELS[payload.tool] || payload.tool)}</span>` +
+      (arg
+        ? `<span class="subagent-step-paren">(</span><span class="subagent-step-arg">${_escapeHtml(arg)}</span><span class="subagent-step-paren">)</span>`
+        : '') +
+      '<span class="subagent-step-status running">⋮</span>';
+    run.body.appendChild(line);
+    run.stepEls.set(key, line);
+    _scrollFeed();
+    return;
+  }
+
+  if (payload.phase === 'end') {
+    const line = run.stepEls.get(key);
+    if (!line) return;
+    run.stepEls.delete(key);
+    const st = line.querySelector('.subagent-step-status');
+    if (st) {
+      st.classList.remove('running');
+      st.classList.add(payload.status === 'ok' ? 'ok' : 'err');
+      st.textContent = payload.status === 'ok' ? 'ok' : 'err';
+    }
+    _scrollFeed();
+  }
+}
+
+/**
+ * Marca el bloque de un perfil como terminado (ok/err según el resultado del
+ * run anidado que ve el loop padre).
+ * @param {string} name
+ * @param {AgentProgress | null | undefined} progress
+ */
+function finalizeSubagentRun(name, progress) {
+  const run = _subagentRuns.get(name);
+  if (!run) return;
+  run.status.classList.remove('running');
+  const ok = !!progress && progress.status === 'ok';
+  run.status.classList.add(ok ? 'ok' : 'err');
+  run.status.textContent = ok ? 'ok' : 'err';
+}
+
+// ── Init ────────────────────────────────────────────────────────────────────
+setAgentState('idle');
+document.addEventListener('kaoru-language-changed', () => setAgentState(_currentAgentState));

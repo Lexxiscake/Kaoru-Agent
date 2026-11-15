@@ -1,0 +1,184 @@
+# Estrategia de pruebas — Asistente Personal
+
+Documento de referencia del sistema de pruebas: cómo se ejecuta, qué cubre cada suite y las
+convenciones para contribuir. El proyecto prioriza **verificación real** sobre mocks: donde la
+persistencia, el git o el LSP son parte del contrato, la prueba usa la pieza de producción.
+
+```mermaid
+flowchart LR
+    subgraph CORE["Suites del núcleo"]
+        DC["decision + gate + SLO<br/>Fase F"]
+        PR["proactive + persistent"]
+        PR2["proposals + executor"]
+        LSP["lsp_errors<br/>Fase D"]
+        TEL["telemetry<br/>Fase E"]
+    end
+    subgraph AGENT["Agente"]
+        AL["agent_loop + mode"]
+        TC["tool_calling + precedence + visibility"]
+    end
+    subgraph MEM["Memoria"]
+        SG["state_graph"]
+        INT["intent_detection"]
+    end
+    subgraph SEC["Seguridad"]
+        SS["server_security"]
+        OB["openclaw_server_auth"]
+    end
+    E2E["E2E<br/>chat_to_agent_loop"]
+    ALL["Regresión completa<br/>ELECTRON_RUN_AS_NODE=1"]
+
+    DC --> ALL
+    PR --> ALL
+    PR2 --> ALL
+    LSP --> ALL
+    TEL --> ALL
+    AL --> ALL
+    TC --> ALL
+    SG --> ALL
+    INT --> ALL
+    SS --> ALL
+    OB --> ALL
+    E2E --> ALL
+```
+
+---
+
+## 1. Cómo ejecutar
+
+Cada archivo de `tests/` es una suite ejecutable de forma independiente:
+
+```bash
+node scripts/electron-node.js tests/<suite>.js
+```
+
+Para correr todas a la vez:
+
+```bash
+npm test     # runner portable: Linux, macOS y Windows
+```
+
+> **Cierra el asistente antes de la regresión completa:** las suites `test_server_security` e
+> `test_integration_stress` levantan su propio servidor de control en `:18789`. Si el asistente
+> ya está corriendo y ocupa ese puerto, esas suites fallan con 401/errores de conexión.
+
+> **Importante (ABI de Electron):** `better-sqlite3` y `sqlite-vec` están compilados para el ABI de
+> Electron, no para el Node del sistema. Bajo `node` del sistema, `StateGraph` cae a memoria en RAM y
+> la persistencia real no se verifica. Las suites de memoria, estado, sensores y motor proactivo
+> **deben** correr con el Node de Electron; `npm test` y `scripts/electron-node.js` configuran el
+> entorno correcto en cualquier sistema operativo.
+
+La salida de `npm test` es la fuente de verdad para el número de suites y assertions. Este documento
+mantiene el mapa por contratos, sin copiar cifras que cambian cada vez que se agrega cobertura.
+
+## 2. Mapa de suites
+
+La suite `test_website.js` abre las doce páginas públicas en Chromium y comprueba idiomas,
+recursos, enlaces, anclas, móvil, temas, navegación, copia de comandos y funcionamiento sin JS.
+Requiere el navegador de Playwright (`npx playwright install chromium`); no utiliza SQLite.
+
+### Agente y ejecución
+
+| Suite                            | Cobertura                                                                                                                              |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_agent_loop`                | Bucle agente: iteraciones, adaptación a resultados reales, límites, aprobaciones, _fail-closed_, tool-calling nativo con content vacío |
+| `test_agent_loop_mode`           | Modos del loop (smart/fast/task/conversational)                                                                                        |
+| `test_agent_loop_lsp`            | Bucle agente con herramientas LSP (feedback post-edit)                                                                                 |
+| `test_agent_loop_git`            | Bucle agente con herramientas Git nativas                                                                                              |
+| `test_agent_manager`             | Definiciones de agentes y system prompts                                                                                               |
+| `test_tool_calling`              | Schemas nativos, normalización de respuestas y **reintento de tool-calling 413→smart** (Groq fast excede TPM)                          |
+| `test_tool_precedence`           | Resolución de toolset: Skill > MCP > OpenClaw, exclusiones por dominio                                                                 |
+| `test_tool_visibility`           | Visibilidad de herramientas según toolIntent                                                                                           |
+| `test_tools_e2e`                 | Puentes de herramientas y aprobación de alto impacto                                                                                   |
+| `test_structured_parser_aliases` | Parser estructurado: alias de acciones y mapeo a tools                                                                                 |
+| `test_request_queue`             | Cola de requests del proveedor LLM                                                                                                     |
+| `test_openclaw_bridge_timing`    | Timing y robustez del puente OpenClaw                                                                                                  |
+| `test_openclaw_server_auth`      | Autenticación del servidor de control                                                                                                  |
+| `test_agent_run_controller`      | Estado de runs, steering, cancelación y reanudación                                                                                    |
+| `test_desktop_control`           | Aplicaciones, navegador personal, procesos, cámara y catálogo de permisos                                                              |
+| `test_desktop_automation`        | AT-SPI/UIA, observaciones efímeras, captura ligada a coordenadas y postcondiciones                                                     |
+| `test_browser_bridge`            | Sesiones aisladas, política de red y reproducción verificada de YouTube                                                                |
+| `test_multimodal_tool_result`    | Transporte de capturas a proveedores con visión                                                                                        |
+| `test_repository_intelligence`   | Índice estructural, dependencias, símbolos, impacto y selección focal de pruebas                                                       |
+| `test_chat_voice`                | Conservación de PCM en ASR e interrupción explícita de TTS al abrir el micrófono                                                       |
+| `test_integration_stress`        | Estrés del flujo integrado                                                                                                             |
+
+### Git y GitHub (nativos, §10)
+
+| Suite                    | Cobertura                                                      |
+| ------------------------ | -------------------------------------------------------------- |
+| `test_git_manager`       | `GitManager`: status/diff/log/branch, mutadores con validación |
+| `test_agent_loop_git`    | Dispatch de tools `git_*` en el bucle agente                   |
+| `test_github_manager`    | `GitHubManager`: issues/PRs/actions con transporte inyectable  |
+| `test_github_command`    | Comando `/github` en el chat                                   |
+| `test_oauth_device_flow` | Device flow OAuth (start/poll/expiración)                      |
+
+### Memoria y estado
+
+| Suite                       | Cobertura                                                                                                                                                                                                           |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_state_graph`          | Schema, CRUD de nodos, reconciliación, decay, sesiones con resume tras crash, recall semántico, modo memoria/fallback                                                                                               |
+| `test_fact_reasoner`        | Vigencia de hechos fijos (F3.1): staleness por umbral, `CASCADE_STALENESS`, refresh de `verified_at`, fallback a `created_at`                                                                                       |
+| `test_session_segmentation` | Segmentación temática (F3.2): `_segmentByTopic` separa temas, un `Episode` por segmento, regresión sesión corta → 1 solo `Episode`                                                                                  |
+| `test_user_model_builder`   | Modelo del usuario inferido (F3.3): nodo con `EVIDENCIA_DE` y decay alto, validación anti-fabricación (confidence, labels, episodios, comandos), fusión por similitud, `confirmInferred`, piggyback en `applyDecay` |
+| `test_persistent`           | Presupuesto diario, `StateGraph.forget` (/olvida), `pendingRecap`                                                                                                                                                   |
+
+### Contexto y lenguaje
+
+| Suite                              | Cobertura                                                                    |
+| ---------------------------------- | ---------------------------------------------------------------------------- |
+| `test_intent_detection`            | Detección semántica de intención + fallback a LLM                            |
+| `test_no_fabrication`              | Anti-alucinación en la composición del contexto                              |
+| `test_lsp`                         | Cliente LSP (schemas, interfaces, integración con Core)                      |
+| `test_lsp_requests`                | Requests JSON-RPC y transporte del LSP                                       |
+| `test_lsp_errors`                  | Sensor LSP → señal → parche → verificación + rollback + blindaje de lenguaje |
+| `test_skills` / `test_skills_edge` | Sistema de skills: registro, match, inyección y casos límite                 |
+| `test_commands`                    | Comandos `/…`, contratos IPC y resolución de archivos                        |
+| `test_file_resolver`               | Resolución segura de rutas                                                   |
+
+### Gestos y comportamiento del modelo
+
+| Suite                    | Cobertura                                         |
+| ------------------------ | ------------------------------------------------- |
+| `test_gesture_lexicon`   | Léxico multilingüe de estados de ánimo → gestos   |
+| `test_gesture_heuristic` | Heurística de asignación de gestos a emociones    |
+| `test_gesture_engine`    | Cooldowns, revertido automático y colas de gestos |
+
+### Decisión proactiva y aprendizaje (Fases F–G)
+
+| Suite                    | Cobertura                                                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `test_decision_core`     | Score de relevancia, receptividad, presupuesto dinámico, política con histéresis, ajuste por aprendizaje, `deriveWeights`, audit log |
+| `test_signal_normalizer` | Candidatos desde payloads reales; perfiles genéricos para señales desconocidas; `registerProfile`                                    |
+| `test_context_gate`      | Flow detection, presupuesto, cola QUEUE, triggers temporales `selfGated`, pesos aprendidos                                           |
+| `test_gate_integration`  | El gate decide antes del LLM; shadow mode; outcome → receptividad; drenado de cola                                                   |
+| `test_slo`               | SLOs por tipo, tasa de no-molestia, degradación automática                                                                           |
+| `test_learning`          | `LearningEngine`: pesos desde feedback del `ProposalStore`, outcomes de tareas                                                       |
+| `test_telemetry`         | Métricas de uso, reporte mensual con deltas y veredicto                                                                              |
+
+### Seguridad
+
+| Suite                       | Cobertura                                                                 |
+| --------------------------- | ------------------------------------------------------------------------- |
+| `test_server_security`      | Redacción de secretos, seguridad de endpoints, bloqueo de rutas sensibles |
+| `test_keychain_integration` | Credenciales en el llavero del SO: overlay de keys, migración, borrado    |
+
+### E2E
+
+| Suite                                  | Cobertura                                                                                                                              |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/e2e/test_chat_to_agent_loop.js` | Chat → bucle agente con piezas de producción                                                                                           |
+| `tests/e2e/test_stream_ipc_e2e.js`     | Streaming de tokens por IPC + modo agente/chat (mock `mock-stream`; claves vía `configure(apiKeys)`, sin depender del keychain del SO) |
+| `tests/e2e/test_ui_electron.js`        | UI del chat con Electron + Playwright (job `e2e-ui` del CI)                                                                            |
+
+---
+
+## 3. Convenciones de contribución
+
+1. **Toda funcionalidad nueva debe acompañar su suite** en `tests/` (misma carpeta, prefijo `test_`).
+2. **Verificación real donde el contrato lo exige:** git real (`check-ignore`), LSP real, SQLite real
+   — no mocks de humo.
+3. **El LLM es el único permitido como stub** en las pruebas de integración (el texto de las
+   propuestas es lo único que el modelo inventa); el resto son piezas de producción.
+4. **Cada suite es ejecutable en solitario** y termina con `process.exit(failed ? 1 : 0)`.
+5. **Regresión completa en verde antes de cualquier PR** (ver tabla de la sección 1).

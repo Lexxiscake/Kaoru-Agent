@@ -1,0 +1,190 @@
+{
+  "name": "asistente-personal",
+  "version": "2.3.1",
+  "desktopName": "com.asistente.personal",
+  "description": "Asistente personal de escritorio con avatar Live2D, memoria y proactividad",
+  "main": "main.js",
+  "bin": {
+    "asistente": "./bin/asistente.js"
+  },
+  "license": "MIT",
+  "author": "Dregxmoon",
+  "scripts": {
+    "start": "electron .",
+    "postinstall": "node fix-electron.js && node scripts/link-asistente.js",
+    "rebuild": "npx @electron/rebuild -f --only better-sqlite3",
+    "test": "node tests/run-all.js",
+    "coverage": "bash scripts/coverage.sh",
+    "coverage:check": "bash scripts/coverage.sh --check",
+    "lint": "eslint main.js openclaw-server.js kaoru-tool-host.js core infrastructure ipc tests benchmarks src --ext .js",
+    "lint:fix": "eslint --fix main.js openclaw-server.js kaoru-tool-host.js core infrastructure ipc tests benchmarks src --ext .js",
+    "format": "prettier --write \"main.js\" \"openclaw-server.js\" \"kaoru-tool-host.js\" \"{core,infrastructure,ipc,tests,benchmarks,src}/**/*.js\"",
+    "format:check": "prettier --check \"main.js\" \"openclaw-server.js\" \"kaoru-tool-host.js\" \"{core,infrastructure,ipc,tests,benchmarks,src}/**/*.js\"",
+    "typecheck": "tsc --noEmit",
+    "init-db": "node scripts/electron-node.js infrastructure/database/init_vectors.js",
+    "cli": "node scripts/electron-node.js bin/cli.js",
+    "cli:help": "node scripts/electron-node.js bin/cli.js help",
+    "bench": "node scripts/electron-node.js benchmarks/run.js",
+    "bench:one": "node scripts/electron-node.js benchmarks/run.js rename-multiply",
+    "bench:summary": "node scripts/electron-node.js benchmarks/summary.js",
+    "build": "electron-builder --config scripts/build-config.js --win --x64",
+    "build-portable": "electron-builder --config scripts/build-config.js --win portable",
+    "build:win": "electron-builder --config scripts/build-config.js --win --x64",
+    "build:mac": "electron-builder --config scripts/build-config.js --mac --x64 --arm64",
+    "build:linux": "electron-builder --config scripts/build-config.js --linux --x64",
+    "build:all": "electron-builder --config scripts/build-config.js --win --x64 && electron-builder --config scripts/build-config.js --mac --x64 --arm64 && electron-builder --config scripts/build-config.js --linux --x64"
+  },
+  "devDependencies": {
+    "@electron/asar": "^3.4.1",
+    "@electron/rebuild": "^4.2.0",
+    "@types/node": "^26.1.2",
+    "c8": "^12.0.0",
+    "electron": "^28.0.0",
+    "electron-builder": "^26.15.3",
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.0",
+    "typescript": "^7.0.2"
+  },
+  "build": {
+    "appId": "com.asistente.personal",
+    "productName": "Asistente Personal",
+    "afterPack": "scripts/after-pack.js",
+    "directories": {
+      "output": "dist"
+    },
+    "extraResources": [
+      {
+        "from": "asr_stream.py",
+        "to": "asr_stream.py"
+      },
+      {
+        "from": "requirements.txt",
+        "to": "requirements.txt"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "include": "build/installer.nsh"
+    },
+    "mac": {
+      "icon": "build/icon.png",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.utilities",
+      "identity": null,
+      "hardenedRuntime": false,
+      "notarize": false
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "syncDesktopName": true,
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Utility",
+      "maintainer": "Dregxmoon"
+    },
+    "files": [
+      "main.js",
+      "openclaw-server.js",
+      "kaoru-tool-host.js",
+      "bin/**/*",
+      "core/**/*",
+      "infrastructure/**/*",
+      "ipc/**/*",
+      "plugins/**/*",
+      "src/**/*",
+      "assets/**/*",
+      "vendor/**/*",
+      "models/March 7th/**/*",
+      "!data/**/*",
+      "!tests/**/*",
+      "!benchmarks/**/*"
+    ],
+    "asarUnpack": [
+      "node_modules/sqlite-vec-*/**/*",
+      "node_modules/node-pty/**/*"
+    ]
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@xenova/transformers": "^2.17.2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "better-sqlite3": "^11.0.0",
+    "diff": "^9.0.0",
+    "dompurify": "^3.4.12",
+    "dotenv": "^17.4.2",
+    "marked": "^9.1.6",
+    "mermaid": "^11.4.1",
+    "minimatch": "^10.2.0",
+    "node-edge-tts": "^1.2.10",
+    "node-pty": "^1.1.0",
+    "onnxruntime-node": "^1.14.0",
+    "pixi-live2d-display": "^0.4.0",
+    "pixi.js": "^6.5.10",
+    "playwright": "^1.61.0",
+    "sqlite-vec": "^0.1.9"
+  },
+  "overrides": {
+    "pixi-live2d-display": {
+      "gh-pages": "^5.0.0"
+    },
+    "@xenova/transformers": {
+      "sharp": "^0.33.5",
+      "onnxruntime-web": {
+        "onnx-proto": {
+          "protobufjs": "^7.6.3"
+        }
+      }
+    }
+  },
+  "engines": {
+    "node": ">=18",
+    "npm": ">=9"
+  }
+}

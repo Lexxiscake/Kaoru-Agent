@@ -1,0 +1,680 @@
+/* exported getPythonBin, TTS_VOICE, VIEW, VIEW_LABELS, VIEW_PERSONALITY, computeContentBounds, LLMProvider, CommandRegistry, FileResolver, AgentManager, ModelAugmenter, initGestureEngine, chatDetectEmotion, pixiApp, model, modelBounds, modelNativeW, modelNativeH, viewMode, currentView, isSpeaking, audioCtx, pendingFiles, openclawAvailable, checkOpenClaw, setAgentMode, getAgentMode, toggleAgentMode, onAgentMode, pushToSession, renderMarkdown, now */
+/* eslint-disable no-unused-vars */
+// @ts-nocheck
+// Sandbox: la página no tiene require() ni Node. Todo llega acotado desde el
+// preload fino vía window.assistant (contextBridge). Usamos `var` (no const)
+// porque contextBridge define window.assistant como propiedad no-configurable
+// y una `const assistant` en ámbito global lanza "Identifier 'assistant' has
+// already been declared" (HasRestrictedGlobalProperty).
+var assistant = window.assistant;
+const ipcRenderer = assistant;
+
+// Se queda SOLO con las líneas que son un trigger reconocido, sin importar
+// dónde caiga la prosa alucinada del modelo — la versión anterior solo
+// cortaba después del ÚLTIMO trigger, así que un párrafo alucinado
+// intercalado ENTRE dos líneas "Ejecutar:" se colaba igual.
+function _sanitizePlanAnnouncement(response) {
+  const triggerRe = /^(Ejecutar:|Voy a leer|Voy a escribir)/i;
+  const triggerLines = response
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => triggerRe.test(l));
+  if (!triggerLines.length) return response;
+  return triggerLines.join('\n');
+}
+
+// P0: 'marked'/'dompurify' se cargan como <script> locales (UMD en
+// node_modules, sin CDN) porque con sandbox:true el preload ya no puede
+// require() de Node. Exponen window.marked / window.DOMPurify en la página y
+// aquí se implementa renderMarkdown completo (incl. el frame de preview de
+// HTML crudo) — antes vivía en el preload (src/chat/preload.js).
+marked.setOptions({ breaks: true, gfm: true });
+
+window.PIXI = PIXI;
+
+// FIX: antes esto era la misma ruta absoluta hardcodeada que main.js tenía
+// duplicada — se rompía en cualquier máquina que no fuera exactamente esta.
+// Ahora se pide una sola vez al proceso main (que ya la resuelve de forma
+// portable, ver resolvePythonBin en main.js) y se cachea.
+let _pythonBinPromise = null;
+function getPythonBin() {
+  if (!_pythonBinPromise)
+    _pythonBinPromise = ipcRenderer.invoke('get-python-bin').catch(() => null);
+  return _pythonBinPromise;
+}
+const TTS_VOICE = 'ja-JP-NanamiNeural';
+
+// Auto-fit por contenido real del modelo (bounds del mesh, no del canvas).
+// Concepto "piso": el borde inferior de la ventana es el corte del cuerpo.
+//   full: f=1.0 → los pies tocan el piso. half: f=0.5 → cintura en el piso.
+//   head: f=0.25 → cuello en el piso. crop=true escala por altura (recorta lados).
+const VIEW = {
+  full: { f: 1.0, tw: 0.98, crop: false },
+  half: { f: 0.5, tw: 1.0, crop: true },
+  head: { f: 0.25, tw: 1.0, crop: true },
+};
+const VIEW_LABELS = {
+  full: 'Cuerpo completo',
+  half: 'Medio cuerpo',
+  head: 'Solo cabeza',
+  random: 'Aleatorio',
+};
+const VIEW_PERSONALITY = {
+  weights: { full: 50, half: 30, head: 20 },
+  duration: { full: { min: 30, max: 80 }, half: { min: 18, max: 45 }, head: { min: 10, max: 25 } },
+};
+
+function computeContentBounds(model) {
+  try {
+    const im = model.internalModel,
+      core = im && im.coreModel;
+    if (!core || typeof core.getDrawableCount !== 'function') return null;
+    const cw = model.width,
+      ch = model.height;
+    if (!cw || !ch) return null;
+    const cnt = core.getDrawableCount();
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
+    for (let i = 0; i < cnt; i++) {
+      const pos = core.getDrawableVertexPositions(i);
+      const c = core.getDrawableVertexCount(i);
+      if (!pos || !c) continue;
+      for (let j = 0; j < c; j++) {
+        const x = pos[j * 2],
+          y = pos[j * 2 + 1];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (minX === Infinity) return null;
+    const B = {
+      x: (minX + 0.5) * cw,
+      y: ch * (0.5 - (maxY * cw) / ch),
+      width: (maxX - minX) * cw,
+      height: (maxY - minY) * cw,
+    };
+    // Centro horizontal de la cabeza (banda superior): las vistas recortadas
+    // (half/head) se centran en él para que la cara no quede cortada.
+    B.headCx = null;
+    const bound = B.y + B.height * 0.35;
+    let hMinX = Infinity,
+      hMaxX = -Infinity;
+    for (let i = 0; i < cnt; i++) {
+      const pos = core.getDrawableVertexPositions(i);
+      const c = core.getDrawableVertexCount(i);
+      if (!pos || !c) continue;
+      for (let j = 0; j < c; j++) {
+        const px = (pos[j * 2] + 0.5) * cw;
+        const py = ch * (0.5 - (pos[j * 2 + 1] * cw) / ch);
+        if (py <= bound) {
+          if (px < hMinX) hMinX = px;
+          if (px > hMaxX) hMaxX = px;
+        }
+      }
+    }
+    if (hMinX <= hMaxX) B.headCx = (hMinX + hMaxX) / 2;
+    return B;
+  } catch (_) {
+    return null;
+  }
+}
+
+const LLMProvider = assistant.LLMProvider;
+const CommandRegistry = assistant.CommandRegistry;
+const FileResolver = assistant.FileResolver;
+const AgentManager = assistant.AgentManager;
+const ModelAugmenter = assistant.ModelAugmenter;
+
+// Loader mínimo de módulos core propios en la página. Las clases como
+// GestureEngine DEBEN ejecutarse aquí: reciben el objeto Live2D real (creado
+// por PIXI en la página) que no puede cruzar el contextBridge, y `new` no
+// funciona sobre los proxies del bridge. Con sandbox:true los fuentes llegan
+// en un LOTE vía IPC (chat-core-sources) y el loader los resuelve en
+// síncrono — necesario porque GestureEngine.js hace `require()` en top-level
+// al ejecutarse. ModelAugmenter se resuelve al proxy IPC expuesto por el
+// preload (llamadas a métodos, no constructor). Esto no le da a la página —ni
+// a los scripts remotos de los CDN— acceso a Node.
+let __coreSources = null;
+let __coreSourcesReady = null;
+function initCoreSources() {
+  if (!__coreSourcesReady) {
+    __coreSourcesReady = assistant
+      .coreSources()
+      .then((s) => {
+        __coreSources = s || {};
+      })
+      .catch(() => {
+        __coreSources = {};
+      });
+  }
+  return __coreSourcesReady;
+}
+const __coreLoader = (() => {
+  const cache = {};
+  const load = (name) => {
+    const key = String(name).replace(/^\.\//, '').replace(/\.js$/, '');
+    if (cache[key]) return cache[key].exports;
+    if (key === 'ModelAugmenter') return assistant.ModelAugmenter;
+    const source = __coreSources && __coreSources[key];
+    if (source == null) throw new Error('Módulo core no permitido en la página: ' + name);
+    const module = { exports: {} };
+    cache[key] = module;
+    new Function('require', 'module', 'exports', source)(load, module, module.exports);
+    return module.exports;
+  };
+  return load;
+})();
+let GestureEngine = null;
+let agentStates = null;
+// Carga los módulos core en background (se resuelven síncrono después). Tanto
+// initGestureEngine como el listener de agent-progress dependen de ellos.
+async function initCoreModules() {
+  await initCoreSources();
+  if (!GestureEngine) GestureEngine = __coreLoader('./GestureEngine.js');
+  if (!agentStates) agentStates = __coreLoader('./agentStates.js');
+}
+initCoreModules();
+
+// Motor de gestos del mini-avatar del chat: reacciona a los eventos del propio
+// chat (initiative/proposal/plan/agent/commandos) y al tono de los mensajes.
+let chatGestureEngine = null;
+let chatGestureConfig = null;
+let _chatGestureCfgPromise = null;
+function getGestureConfig() {
+  if (!_chatGestureCfgPromise) {
+    _chatGestureCfgPromise = ipcRenderer.invoke('gesture-config').catch(() => null);
+  }
+  return _chatGestureCfgPromise;
+}
+async function initGestureEngine() {
+  if (chatGestureEngine) return chatGestureEngine;
+  const cfg = (await getGestureConfig()) || {};
+  // Animaciones espontáneas SIEMPRE en el mini-avatar del chat: aunque el
+  // usuario no haya configurado nada, Kaoru gesticula sola periódicamente.
+  chatGestureConfig = { ...cfg, ambient: cfg.ambient !== false };
+  await initCoreModules();
+  chatGestureEngine = new GestureEngine({ config: chatGestureConfig });
+  return chatGestureEngine;
+}
+
+// Detector de emoción barato para mensajes del usuario (mismo espíritu que el
+// del overlay): solo influye en el gesto del mini-avatar.
+function chatDetectEmotion(text) {
+  const t = String(text || '').toLowerCase();
+  if (/error|fallo|problema|no pude|lo siento|perdon|triste|mal/.test(t)) return 'sad';
+  if (/genial|perfecto|listo|hecho|exito|bien|super|increible|gracias/.test(t)) return 'excited';
+  if (/procesando|espera|momento|calculando|buscando|puedes/.test(t)) return 'think';
+  if (/hola|hey|buenos|quiero que/i.test(t)) return 'happy';
+  return 'default';
+}
+
+// Estado global
+let pixiApp, model;
+let modelBounds = null;
+let modelNativeW = 0;
+let modelNativeH = 0;
+let viewMode = 'random';
+let currentView = 'head';
+let isSpeaking = false;
+let audioCtx = null;
+let pendingFiles = [];
+let _modelInfo = null;
+let _modelNames = [];
+let _motionTimer = null;
+let _workspacePath = null;
+let _atProjectFiles = null;
+
+ipcRenderer
+  .invoke('get-model-info')
+  .then((info) => {
+    if (info && info.model3Path) _modelInfo = info;
+  })
+  .catch((e) => console.error('[chat] no se pudo obtener info del modelo:', (e && e.message) || e));
+ipcRenderer
+  .invoke('models-list')
+  .then((models) => {
+    _modelNames = (models || []).map((m) => m.name);
+  })
+  .catch((e) => console.error('[chat] no se pudo listar modelos:', (e && e.message) || e));
+
+// Fase 3
+let openclawAvailable = false;
+
+// Estado de aislamiento de proceso del server (bwrap/AppContainer), reportado en /health.
+// null = sin información (no avisa); false = sandbox desactivado (aviso).
+let openclawSandbox = null;
+let openclawSandboxReason = null;
+
+// Banner persistente de sandbox desactivado. No es un toast: si los execs de
+// alto impacto corren sin aislamiento de proceso, el usuario lo ve siempre.
+function updateSandboxBanner() {
+  const banner = document.getElementById('sandbox-banner');
+  if (!banner) return;
+  const disabled = openclawSandbox === false;
+  banner.classList.toggle('visible', disabled);
+  if (disabled) {
+    const reason = openclawSandboxReason || window.kaoruI18n.t('unknownReason');
+    banner.textContent = window.kaoruI18n.format('sandboxUnavailableBanner', { reason });
+  }
+}
+document.addEventListener('kaoru-language-changed', updateSandboxBanner);
+
+async function checkOpenClaw() {
+  try {
+    const status = await assistant.invoke('openclaw-status');
+    if (status) {
+      openclawAvailable = Boolean(status.available);
+      openclawSandbox =
+        status.sandbox === undefined || status.sandbox === null ? null : Boolean(status.sandbox);
+      openclawSandboxReason = status.sandboxReason || null;
+      updateSandboxBanner();
+    }
+  } catch {
+    openclawAvailable = false;
+  }
+}
+
+// Flujo unificado: toda entrada usa Core.runAgent → AgentLoop. `fast`/`smart`
+// siguen existiendo como routing interno automático, no como dos productos
+// que el usuario deba alternar manualmente.
+const _agentMode = 'agent';
+const _agentModeListeners = new Set();
+
+function setAgentMode() {
+  return _agentMode;
+}
+
+function getAgentMode() {
+  return _agentMode;
+}
+
+function toggleAgentMode() {
+  return _agentMode;
+}
+
+function onAgentMode(fn) {
+  _agentModeListeners.add(fn);
+  fn(_agentMode);
+  return () => _agentModeListeners.delete(fn);
+}
+
+const sessionHistory = [];
+const MAX_SESSION_HISTORY = 20;
+
+function pushToSession(role, content) {
+  sessionHistory.push({ role, content });
+  if (sessionHistory.length > MAX_SESSION_HISTORY)
+    sessionHistory.splice(0, sessionHistory.length - MAX_SESSION_HISTORY);
+}
+
+let mermaidReady = false;
+
+function loadMermaid() {
+  const s = document.createElement('script');
+  // Fase 1: se sirve local desde node_modules (sin CDN).
+  s.src = '../node_modules/mermaid/dist/mermaid.min.js';
+  s.onload = () => {
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      themeVariables: {
+        background: 'transparent',
+        primaryColor: '#10b981',
+        primaryTextColor: '#e2e8f0',
+        lineColor: '#4a5568',
+      },
+    });
+    mermaidReady = true;
+    document.querySelectorAll('.mermaid').forEach((el) => _renderMermaid(el));
+  };
+  document.head.appendChild(s);
+}
+loadMermaid();
+
+async function _renderMermaid(el) {
+  if (!mermaidReady || el.dataset.rendered) return;
+  el.dataset.rendered = '1';
+  try {
+    const { svg } = await mermaid.render(
+      `m-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      el.textContent
+    );
+    const wrapper = document.createElement('div');
+    wrapper.className = 'mermaid-wrapper';
+    wrapper.innerHTML = svg;
+    el.parentNode.replaceChild(wrapper, el);
+  } catch {}
+}
+
+// Marka de bloque HTML crudo extraído: se sustituye en el markdown ANTES de
+// marked y se reemplaza por el frame de preview DESPUÉS de DOMPurify.
+const HTML_PREVIEW_RE = /@@HTMLPREVIEW(\d+)@@/g;
+
+// Extrae bloques de HTML crudo del texto y los reemplaza por marcadores.
+// Devuelve { text, previews } donde previews[i] es el HTML crudo. Durante el
+// streaming un documento llega INCOMPLETO (falta el cierre): en ese caso el
+// preview pendiente se marca para mostrarse como código en vivo (no página a
+// medias) hasta que el render final vea el </html> y lo convierta en iframe.
+function _extractRawHtml(md, opts) {
+  if (typeof md !== 'string' || !md) return { text: md, previews: [], pending: null };
+
+  // Proteger code fences: el HTML que ya va dentro de ```html ``` NO se toca.
+  const fences = [];
+  const noFences = md.replace(/```[\s\S]*?```/g, (m) => {
+    const idx = fences.length;
+    fences.push(m);
+    return `@@FENCE${idx}@@`;
+  });
+
+  const previews = [];
+  let body = noFences;
+
+  // Documento HTML completo (<!DOCTYPE html> ... </html> o <html>...</html>).
+  const docRe = /(?:<!DOCTYPE\s+html[\s\S]*?<\/html>|<html[^>]*>[\s\S]*?<\/html>)/gi;
+  body = body.replace(docRe, (m) => {
+    previews.push(m);
+    return `@@HTMLPREVIEW${previews.length - 1}@@`;
+  });
+
+  // Fragmento HTML con varios tags de bloque pero SIN <html> envolvente
+  // (p. ej. el modelo emite solo <div>...<style>...<script>...).
+  const fragRe =
+    /((?:<style[^>]*>[\s\S]*?<\/style>|<script[^>]*>[\s\S]*?<\/script>|<[a-z][\s\S]*?<\/[a-z]+>){2,})/gi;
+  body = body.replace(fragRe, (m) => {
+    previews.push(m);
+    return `@@HTMLPREVIEW${previews.length - 1}@@`;
+  });
+
+  // Streaming: apertura de documento sin cierre → marcar como pendiente.
+  let pending = null;
+  if (opts && opts.streaming && !previews.length) {
+    const openRe = /<!DOCTYPE\s+html|<html[^>]*>|<body[^>]*>|<head[^>]*>/i;
+    const closeRe = /<\/html>/i;
+    if (openRe.test(body) && !closeRe.test(body)) {
+      // Buscar el fragmento pendiente: desde la apertura hasta el final o el
+      // primer doble salto de línea que cierre el bloque.
+      const m = openRe.exec(body);
+      if (m) {
+        const rest = body.slice(m.index);
+        const end = rest.search(/\n\s*\n/);
+        pending = end === -1 ? rest : rest.slice(0, end);
+        body =
+          body.slice(0, m.index) + '@@HTMLPREVIEWSTREAM@@' + (end === -1 ? '' : rest.slice(end));
+      }
+    }
+  }
+
+  // Restaurar fences.
+  const restored = body.replace(/@@FENCE(\d+)@@/g, (m, i) => fences[Number(i)] || '');
+  return { text: restored, previews, pending };
+}
+
+function _escapeAttr(text) {
+  return escapeHtml(text).replace(/"/g, '&quot;');
+}
+
+// Formatea HTML de una sola línea para mostrarlo legible en el frame de
+// código: pone un salto de línea antes de cada etiqueta de apertura/cierre y
+// después de los cierres de bloque. NO altera el HTML funcional (el iframe usa
+// el html crudo); solo embellece la vista de "Código".
+function _prettyHtml(html) {
+  if (!html || typeof html !== 'string') return html;
+  return html
+    .replace(/>\s*</g, '>\n<')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// Frame de preview: recuadro con título + ruta del archivo (si se conoce) +
+// iframe sandboxed con el HTML crudo (srcdoc) y debajo el código fuente en un
+// <details>. El sandbox permite scripts pero sin same-origin, así el HTML
+// generado por el LLM no puede escapar del iframe ni tocar el chat.
+function _htmlPreviewFrame(html, index, filePath) {
+  const esc = escapeHtml(_prettyHtml(html));
+  const pathHtml = filePath
+    ? `<span class="html-preview-path" title="${_escapeAttr(filePath)}">${escapeHtml(filePath)}</span>`
+    : '';
+  return (
+    '<div class="html-preview">' +
+    `<div class="html-preview-head">` +
+    `<span class="html-preview-title">${window.kaoruI18n.t('preview')}</span>` +
+    pathHtml +
+    `<span class="html-preview-count">#${index + 1}</span>` +
+    `</div>` +
+    `<iframe class="html-preview-iframe" sandbox="allow-scripts" srcdoc="${_escapeAttr(html)}"></iframe>` +
+    `<details class="html-preview-code"><summary>${window.kaoruI18n.t('code')}</summary>` +
+    `<pre class="html-preview-pre"><code>${esc}</code></pre>` +
+    '</details>' +
+    '</div>'
+  );
+}
+
+// Resaltado local y acotado: conserva cada carácter y nunca interpreta HTML.
+function _highlightCode(code, language) {
+  const source = code.textContent || '';
+  if (language.toLowerCase() === 'diff' && source.length <= 40000) {
+    const fragment = document.createDocumentFragment();
+    for (const line of source.split(/(?<=\n)/)) {
+      const span = document.createElement('span');
+      span.className = line.startsWith('+')
+        ? 'syntax-added'
+        : line.startsWith('-')
+          ? 'syntax-removed'
+          : line.startsWith('@@')
+            ? 'syntax-keyword'
+            : '';
+      span.textContent = line;
+      fragment.append(span);
+    }
+    code.replaceChildren(fragment);
+    return;
+  }
+  if (
+    source.length > 40000 ||
+    !/^(js|javascript|jsx|ts|typescript|tsx|json|py|python|sh|bash|shell|css|diff)$/i.test(language)
+  )
+    return;
+  const hashComments = /^(py|python|sh|bash|shell)$/i.test(language);
+  const tokens =
+    /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\/\/[^\n]*|\/\*[\s\S]*?\*\/|#[^\n]*)|\b(const|let|var|function|return|async|await|if|else|for|while|class|new|throw|try|catch|import|from|export|default|def|in|None|True|False|true|false|null|print|echo|sudo)\b|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*(?=\s*\()/g;
+  const fragment = document.createDocumentFragment();
+  let offset = 0;
+  for (const match of source.matchAll(tokens)) {
+    fragment.append(source.slice(offset, match.index));
+    const token = document.createElement('span');
+    const comment = match[2] && (!match[0].startsWith('#') || hashComments);
+    token.className = match[1]
+      ? 'syntax-string'
+      : comment
+        ? 'syntax-comment'
+        : match[3]
+          ? 'syntax-keyword'
+          : /^\d/.test(match[0])
+            ? 'syntax-number'
+            : 'syntax-function';
+    if (match[0].startsWith('#') && !hashComments) token.className = '';
+    token.textContent = match[0];
+    fragment.append(token);
+    offset = match.index + match[0].length;
+  }
+  fragment.append(source.slice(offset));
+  code.replaceChildren(fragment);
+}
+
+// Decora HTML ya saneado, sin interpolar contenido generado en controles.
+function _decorateMarkdown(html) {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  template.content.querySelectorAll('pre > code').forEach((code) => {
+    const pre = code.parentElement;
+    if (pre.classList.contains('html-preview-pre')) return;
+    const language = [...code.classList].find((name) => name.startsWith('language-'));
+    const label = language ? language.slice(9).slice(0, 32) : window.kaoruI18n.t('code');
+    _highlightCode(code, label);
+    const lines = (code.textContent || '').replace(/\n$/, '').split('\n').length;
+    const frame = document.createElement('section');
+    frame.className = 'message-code';
+    frame.setAttribute('aria-label', window.kaoruI18n.format('codeBlock', { language: label }));
+    const header = document.createElement('div');
+    header.className = 'message-code-header';
+    const title = document.createElement('span');
+    title.className = 'message-code-language';
+    title.textContent = label;
+    const count = document.createElement('span');
+    count.className = 'message-code-count';
+    count.textContent = window.kaoruI18n.format(lines === 1 ? 'codeLineOne' : 'codeLineMany', {
+      count: lines,
+    });
+    header.append(title, count);
+    const shellCommand =
+      /^(?:bash|sh|zsh|fish|shell|powershell|pwsh|cmd)$/.test(label.toLowerCase()) &&
+      !(code.textContent || '').trim().includes('\n');
+    for (const [action, text] of [
+      ['wrap', window.kaoruI18n.t('wrapLines')],
+      ['copy', window.kaoruI18n.t('copy')],
+      ...(shellCommand
+        ? [
+            ['paste-terminal', window.kaoruI18n.t('pasteInTerminal')],
+            ['run-terminal', window.kaoruI18n.t('runInTerminal')],
+          ]
+        : []),
+    ]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.codeAction = action;
+      button.textContent = text;
+      if (action === 'wrap') button.setAttribute('aria-pressed', 'false');
+      header.appendChild(button);
+    }
+    pre.replaceWith(frame);
+    pre.tabIndex = 0;
+    pre.setAttribute('aria-label', window.kaoruI18n.format('codeAria', { language: label }));
+    frame.append(header, pre);
+  });
+  template.content.querySelectorAll('table').forEach((table) => {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message-table';
+    wrapper.tabIndex = 0;
+    wrapper.setAttribute('role', 'region');
+    wrapper.setAttribute('aria-label', window.kaoruI18n.t('messageTable'));
+    table.replaceWith(wrapper);
+    wrapper.appendChild(table);
+  });
+  return template.innerHTML;
+}
+document.addEventListener('kaoru-language-changed', () => {
+  for (const table of document.querySelectorAll('.message-table'))
+    table.setAttribute('aria-label', window.kaoruI18n.t('messageTable'));
+  for (const frame of document.querySelectorAll('.message-code')) {
+    const code = frame.querySelector('pre > code');
+    const language = [...(code?.classList || [])].find((name) => name.startsWith('language-'));
+    const label = language ? language.slice(9).slice(0, 32) : window.kaoruI18n.t('code');
+    frame.setAttribute('aria-label', window.kaoruI18n.format('codeBlock', { language: label }));
+    frame.querySelector('.message-code-language').textContent = label;
+    frame
+      .querySelector('pre')
+      .setAttribute('aria-label', window.kaoruI18n.format('codeAria', { language: label }));
+    const lines = (code?.textContent || '').replace(/\n$/, '').split('\n').length;
+    frame.querySelector('.message-code-count').textContent = window.kaoruI18n.format(
+      lines === 1 ? 'codeLineOne' : 'codeLineMany',
+      { count: lines }
+    );
+    for (const button of frame.querySelectorAll('[data-code-action]')) {
+      const key = {
+        wrap: 'wrapLines',
+        copy: 'copy',
+        'paste-terminal': 'pasteInTerminal',
+        'run-terminal': 'runInTerminal',
+      }[button.dataset.codeAction];
+      if (key) button.textContent = window.kaoruI18n.t(key);
+    }
+  }
+  for (const frame of document.querySelectorAll('.html-preview')) {
+    frame.querySelector('.html-preview-title').textContent = window.kaoruI18n.t('preview');
+    frame.querySelector('.html-preview-code summary').textContent = window.kaoruI18n.t('code');
+  }
+});
+
+function renderMarkdown(md, opts) {
+  try {
+    const { text, previews, pending } = _extractRawHtml(md, opts);
+    let rawHtml = marked.parse(text || '');
+
+    // HTML crudo incompleto en streaming: se muestra como código en vivo.
+    if (pending) {
+      const esc = escapeHtml(pending);
+      rawHtml = rawHtml.replace(
+        '@@HTMLPREVIEWSTREAM@@',
+        `<pre class="html-preview-pre html-preview-stream"><code class="language-html">${esc}</code></pre>`
+      );
+    }
+
+    rawHtml = rawHtml.replace(
+      /<pre><code class="language-mermaid">([\s\S]*?)<\/code><\/pre>/g,
+      '<div class="mermaid">$1</div>'
+    );
+    rawHtml = _decorateMarkdown(DOMPurify.sanitize(rawHtml));
+    if (previews.length) {
+      const filePath = opts && opts.path ? String(opts.path) : '';
+      rawHtml = rawHtml.replace(HTML_PREVIEW_RE, (m, i) => {
+        const html = previews[Number(i)];
+        return html == null ? '' : _htmlPreviewFrame(html, i, filePath);
+      });
+    }
+    return rawHtml;
+  } catch (e) {
+    console.warn('error renderizando markdown, cae a texto plano:', e.message);
+    return escapeHtml(md);
+  }
+}
+
+function escapeHtml(text) {
+  return (text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Tema
+const html = document.documentElement;
+const themeToggle = document.getElementById('theme-toggle');
+
+function setTheme(t) {
+  const theme = t === 'sakura' ? 'light' : t;
+  html.setAttribute('data-theme', theme);
+  const isLight = theme === 'light';
+  themeToggle.setAttribute('aria-checked', String(isLight));
+  themeToggle.setAttribute('aria-label', window.kaoruI18n.t(isLight ? 'darkTheme' : 'lightTheme'));
+  themeToggle.title = window.kaoruI18n.t(isLight ? 'darkThemeTitle' : 'lightThemeTitle');
+  ipcRenderer.send('chat-theme-changed', theme);
+}
+document.addEventListener('kaoru-language-changed', () => {
+  const isLight = html.getAttribute('data-theme') === 'light';
+  themeToggle.setAttribute('aria-label', window.kaoruI18n.t(isLight ? 'darkTheme' : 'lightTheme'));
+  themeToggle.title = window.kaoruI18n.t(isLight ? 'darkThemeTitle' : 'lightThemeTitle');
+});
+themeToggle.addEventListener('click', () =>
+  setTheme(html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark')
+);
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  const openModal = [
+    ['#perms-modal.visible', '#perms-close-x'],
+    ['#prefs-modal.visible', '#prefs-close'],
+    ['#sessions-modal.visible', '#sessions-close'],
+    ['#settings-modal.visible', '#picker-close'],
+  ].find(([modalSelector]) => document.querySelector(modalSelector));
+  if (!openModal) return;
+  const closeButton = document.querySelector(openModal[1]);
+  if (closeButton) closeButton.click();
+});
+
+function now() {
+  return new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' });
+}

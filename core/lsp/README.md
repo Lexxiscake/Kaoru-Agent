@@ -1,0 +1,69 @@
+# Cliente LSP (`core/lsp/`)
+
+Conexión con servidores de lenguaje (Language Server Protocol) para dotar al asistente de **contexto de
+código real**: errores del editor, símbolos del proyecto y verificación de parches.
+
+---
+
+## `LSPManager.js`
+
+Cliente LSP sobre `typescript-language-server` (stdio).
+
+**Responsabilidades:**
+
+- Arrancar el servidor de lenguaje del workspace con idioma auto-detectado (`detectLanguageForWorkspace`).
+- Declarar la capability `publishDiagnostics` (sin esto el servidor no envía errores).
+- Mantener archivos abiertos (`didOpen` / `didChange` / `didClose`).
+- Servir **diagnósticos** (errores/avisos) y consultas de símbolos al motor proactivo.
+- Timeout en peticiones (nunca se cuelga) y reinicio limpio al cambiar de workspace.
+
+## `SymbolIndex.js`
+
+Índice de símbolos del workspace construido desde `getDocumentSymbols` del LSP:
+
+- Aplana el árbol de símbolos (children recursivos, `kindName` real, línea).
+- Cache con TTL de 60 s e `invalidate(file)` — no vuelve a molestar al servidor innecesariamente.
+- Nunca lanza: si el LSP no está disponible, devuelve vacío.
+
+## `RepositoryIntelligence.js`
+
+Índice estructural asíncrono que conecta la planificación con la verificación:
+
+- Recorre el workspace sin seguir enlaces simbólicos ni entrar en dependencias, builds o cachés.
+- Omite nombres de archivos de credenciales conocidos y nunca persiste contenido fuente.
+- Resuelve dependencias locales CommonJS/ESM y calcula dependientes transitivos.
+- Enriquece los archivos candidatos con símbolos del `SymbolIndex` cuando el LSP está disponible.
+- Persiste en `userData` un caché acotado de metadatos; una mutación del agente lo invalida.
+- Infiere pruebas relacionadas. Solo genera un comando focal cuando reconoce explícitamente
+  `tests/run-all.sh`; para runners desconocidos conserva la verificación general sin inventar flags.
+
+`Core.runAgent` entrega la misma instancia a `AgentLoop`: el mapa entra al plan antes de actuar y el
+radio de impacto vuelve a consultarse después de editar. Por tanto, no es un índice decorativo ni un
+servicio paralelo desconectado.
+
+---
+
+## Cómo se usa
+
+El sensor `LSPErrorWatcher` (`infrastructure/sensors/`) escucha los diagnósticos del archivo enfocado,
+emite la señal `lsp:error` (con `languageId`/`fileType` detectados por extensión) y alimenta el trigger
+`lsp_error` del motor proactivo. Cuando una propuesta de parche se acepta, `ProactiveExecutor` verifica
+el resultado contra `getDiagnostics()` real y revierte si algo falla.
+
+```mermaid
+flowchart LR
+    EDITOR["Editor<br/>(archivo enfocado)"] --> LSP["LSPManager<br/>typescript-language-server"]
+    LSP -->|"diagnósticos"| W["LSPErrorWatcher<br/>lsp:error + languageId"]
+    W -->|"señal"| E["ProactiveEngine<br/>trigger lsp_error"]
+    E -->|"propuesta de parche"| U["Consentimiento"]
+    U -->|"aceptado"| X["ProactiveExecutor.apply_patch"]
+    X -->|"verificación real"| LSP
+    X -->|"sintaxis"| N["node --check"]
+    N -->|"inválido"| RB["rollback automático"]
+    LSP -->|"símbolos"| SY["SymbolIndex<br/>(TTL 60s)"]
+    SY --> RI["RepositoryIntelligence<br/>dependencias + impacto"]
+    RI --> PLAN["AgentLoop<br/>plan + pruebas focales"]
+```
+
+Verificación: `test_lsp_errors`, `test_lsp` y `test_repository_intelligence` — ver
+`tests/README.md`.

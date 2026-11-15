@@ -1,0 +1,124 @@
+# Ejecución de acciones y agente (`core/planner/`)
+
+Interpreta las intenciones del LLM y las ejecuta como acciones reales en el sistema del usuario — con
+control de impacto, confinamiento de rutas y aprobación explícita para lo que toca el disco o la red.
+
+---
+
+## `Planner.js` — orquestador de ejecución
+
+Analiza la respuesta del LLM en busca de bloques de acción (`action ... `) y decide qué ejecutar:
+
+1. Parseo de intenciones (`ActionParser`).
+2. Clasificación de impacto (bajo → automático, alto → requiere aprobación).
+3. Sanitización de rutas y comandos.
+4. Bloqueo de rutas sensibles (`~/.ssh`, credenciales, cookies de navegador).
+5. Ejecución a través de `OpenClawBridge` o `BrowserBridge`.
+
+## `AgentLoop.js` — bucle agente (LLM → herramienta → resultado)
+
+El modo `task`/`agent` ejecuta un bucle cerrado:
+
+```mermaid
+sequenceDiagram
+    participant U as Usuario
+    participant A as AgentLoop
+    participant LLM as LLM (tool-calling)
+    participant T as Herramienta (OpenClaw/MCP/Browser)
+
+    U->>A: mensaje con intención de acción
+    loop hasta tope de iteraciones (8–25)
+        A->>LLM: prompt + toolset resuelto (Skill > MCP > OpenClaw)
+        LLM-->>A: toolCall nativo
+        alt acción de alto impacto
+            A->>U: solicita aprobación (fail-closed)
+            U-->>A: aprobada / denegada
+        end
+        A->>T: ejecuta acción real
+        T-->>A: resultado real
+        A->>LLM: resultado → siguiente paso
+    end
+    LLM-->>A: texto final
+    A-->>U: respuesta
+```
+
+- **Tool-calling nativo primero** (`completeWithTools`), con fallback textual si falla el parseo o el
+  proveedor.
+- **Aprobación** para acciones de alto impacto (con handler y timeout _fail-closed_).
+- **Límite de iteraciones** configurable (8–25) y resultado truncado para el contexto.
+- **Resolución de herramientas** (Skill > MCP > OpenClaw) inyectada en el prompt.
+- **Regla 9 de edición:** para modificar un archivo existente usa `edit` con `old_text` exacto y
+  coincidencia única (si no coincide, no toca nada); solo usa `write` para crear archivos nuevos.
+  Implica determinismo en la edición.
+- **Fin de cuota:** cuando se agota la cuota de tokens, el loop corta y responde con un mensaje
+  accionable ("me quedé sin cuota…") en vez de fallar en silencio.
+- **Propagación de `meta`:** los resultados de las tools propagan `meta` (p. ej. `addedLines`/
+  `removedLines` del diff) para que el contexto distinga lo nuevo de lo actualizado.
+- **Reflexión intermedia** (`opts.reflection`, on en modo smart): cuando se acumulan fallas reales
+  de herramientas (≥`REFLECTION_MIN_FAILURES`), el loop se DETIENE a evaluar el plan con una
+  llamada LLM estructurada (`_reflect`) que devuelve `CONTINUAR` / `CAMBIAR_PLAN` / `ABANDONAR`.
+  El veredicto vuelve al historial para replanificar o abortar — autocorrección explícita en vez de
+  reintentar a ciegas. Acotado a `REFLECTION_MAX_ROUNDS` y nunca rompe el run si la llamada falla.
+- **Self-critique final** (`opts.selfCritique`, on en modo smart): al terminar con una respuesta de
+  texto, un paso extra compara el resultado contra la intención ORIGINAL del usuario; si es
+  `INCOMPLETA`, el feedback vuelve al loop para cerrar la brecha (acotado a `SELF_CRITIQUE_MAX_ROUNDS`).
+
+## `StructuredActionParser.js`
+
+Parser determinista para bloques de acción estructurados:
+
+```
+ACCIÓN: create_file | ARCHIVO: main.js
+```
+
+Con fallback al parser regex del `Planner` si el modelo no usa el formato estructurado.
+
+## `OpenClawBridge.js` — puente de ejecución
+
+- `exec` / `read` / `write` / `edit` / `list_directory` → servicio OpenClaw (localhost) o mock local.
+- `browser` / `web_search` → `BrowserBridge` (Playwright, navegador propio del asistente).
+- `apply_patch` / `code_execution` → OpenClaw.
+- Las respuestas de `edit` / `apply_patch` incluyen **marcadores de diff** (`addedLines` /
+  `removedLines`) para colorear en la UI y alimentar el `meta` del loop.
+- Verifica disponibilidad del servicio cada 30 s y reporta disponibilidad al motor proactivo.
+
+## `BrowserBridge.js` — navegador aislado y administrado
+
+Dos sesiones Chromium mantenidas con Playwright y **separadas del navegador personal del usuario**:
+una headless para búsquedas y otra visible administrada. Todas las solicitudes pasan por la política
+de URL; las pestañas tienen IDs, las mutaciones exigen el origen observado y se distinguen ejecución
+y postcondición verificada.
+
+`open_website` usa por defecto el navegador personal/predeterminado para conservar las sesiones del
+usuario (por ejemplo, Gmail). El modo `managed` sólo se elige explícitamente cuando Kaoru necesita
+observar y controlar el DOM; `play_media` lo usa para completar y verificar el flujo de YouTube.
+
+El control de aplicaciones nativas vive en `core/desktop/`: AT-SPI2 en Linux y UI Automation en
+Windows. `desktop_snapshot` entrega referencias efímeras; las acciones UI consumen esas referencias
+y `desktop_screenshot` + `pointer_click` forman el fallback visual para canvas o juegos. Las familias
+de aplicaciones, navegador, pantalla, puntero, teclado, procesos y cámara tienen interruptores de
+permiso independientes; habilitar una familia no sustituye la aprobación puntual de una acción.
+
+---
+
+## Matriz de acciones e impacto
+
+| Acción                           | Requiere aprobación |
+| -------------------------------- | ------------------- |
+| `read` / `read_file`             | No                  |
+| `list_directory`                 | No                  |
+| `edit` / `write` / `create_file` | Sí                  |
+| `exec` / `run_command`           | Sí                  |
+| `browser` / `web_search`         | Sí                  |
+| `desktop_*` / `window_*` / `ui_*` | Sí                 |
+| `apply_patch`                    | Sí                  |
+| `code_execution`                 | Sí                  |
+
+---
+
+## Verificación
+
+`test_agent_loop` (38) y `test_agent_loop_mode` (14): loop, adaptación a resultados reales, límite de
+iteraciones, aprobaciones, _fail-closed_, tool-calling nativo, **reflexión intermedia** (replanifica
+tras fallas; no se dispara sin `opts.reflection`) y self-critique. `test_tools_e2e`, `test_openclaw_*` y
+`test_server_security`: puentes y seguridad. Ver `tests/README.md`.

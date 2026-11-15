@@ -1,0 +1,180 @@
+'use strict';
+
+// SessionApprovals — allowlist "Siempre" de sesión (estilo opencode
+// once/always/reject). El botón "Siempre" del card de aprobación registra un
+// patrón; mientras la sesión viva, los actions que lo matcheen se auto-aprueban
+// sin volver a mostrar el card.
+
+const {
+  approvalPattern,
+  isApproved,
+  addApproval,
+  resetApprovals,
+} = require('../core/security/SessionApprovals.js');
+
+const C = {
+  green: (s) => `\x1b[32m${s}\x1b[0m`,
+  red: (s) => `\x1b[31m${s}\x1b[0m`,
+  yellow: (s) => `\x1b[33m${s}\x1b[0m`,
+  cyan: (s) => `\x1b[36m${s}\x1b[0m`,
+  bold: (s) => `\x1b[1m${s}\x1b[0m`,
+  dim: (s) => `\x1b[2m${s}\x1b[0m`,
+};
+
+let passed = 0;
+let failed = 0;
+
+function assert(condition, label, detail = '') {
+  if (condition) {
+    console.log(`  ${C.green('✓')} ${label}`);
+    passed++;
+  } else {
+    console.log(`  ${C.red('✗')} ${label}`);
+    if (detail) console.log(`    ${C.dim(detail)}`);
+    failed++;
+  }
+}
+
+function testApprovalPatterns() {
+  console.log(C.bold('\n── approvalPattern: exec / path / resto ─────────────────'));
+
+  assert(
+    approvalPattern({ tool: 'exec', params: { command: 'git status --short' } }) ===
+      'exec:git status',
+    'exec → prefijo de 2 tokens',
+    approvalPattern({ tool: 'exec', params: { command: 'git status --short' } }) || ''
+  );
+  assert(
+    approvalPattern({ tool: 'read', params: { path: '/a/b/c.txt' } }) === 'path:/a/b',
+    'tool con path → "path:<directorio>"',
+    approvalPattern({ tool: 'read', params: { path: '/a/b/c.txt' } }) || ''
+  );
+  assert(
+    approvalPattern({ tool: 'edit', params: { filePath: 'rel/archivo.js' } }) === 'path:rel',
+    'filePath también se reconoce',
+    approvalPattern({ tool: 'edit', params: { filePath: 'rel/archivo.js' } }) || ''
+  );
+  assert(
+    approvalPattern({ tool: 'browser', params: { action: 'navigate' } }) ===
+      'browser:background::navigate:page:e3b0c44298fc1c14',
+    'browser sin URL conserva alcance de acción y modo',
+    approvalPattern({ tool: 'browser', params: {} }) || ''
+  );
+  assert(
+    approvalPattern({
+      tool: 'browser',
+      params: { action: 'navigate', mode: 'managed', url: 'https://youtube.com/results' },
+    }) === 'browser:managed:navigate:youtube.com',
+    'browser navigate limita aprobación por modo y hostname'
+  );
+  assert(
+    approvalPattern({
+      tool: 'browser',
+      params: { action: 'click', mode: 'managed', role: 'button', name: 'Reproducir' },
+    }) === null,
+    'browser interactivo sin sesión/origen no puede aprobarse permanentemente'
+  );
+  const scopedType = approvalPattern({
+    tool: 'browser',
+    params: {
+      action: 'type',
+      mode: 'managed',
+      sessionId: 's1',
+      pageId: 'p1',
+      expectedOrigin: 'https://example.com',
+      role: 'textbox',
+      value: 'secreto-a',
+    },
+  });
+  const changedValue = approvalPattern({
+    tool: 'browser',
+    params: {
+      action: 'type',
+      mode: 'managed',
+      sessionId: 's1',
+      pageId: 'p1',
+      expectedOrigin: 'https://example.com',
+      role: 'textbox',
+      value: 'secreto-b',
+    },
+  });
+  assert(scopedType !== changedValue, 'la aprobación de escritura queda ligada al valor');
+  assert(
+    approvalPattern({ tool: 'launch_app', params: { app: 'Firefox' } }) === 'launch_app:firefox',
+    'launch_app → aprobación limitada a esa aplicación'
+  );
+  assert(
+    approvalPattern({
+      tool: 'open_website',
+      params: { target: 'https://youtube.com/watch?v=1' },
+    }) === 'open_website:external:default:youtube.com',
+    'open_website URL → aprobación del navegador personal limitada al hostname'
+  );
+  assert(
+    approvalPattern({ tool: 'open_website', params: { target: 'drive' } }) ===
+      'open_website:external:default:drive',
+    'open_website alias → aprobación limitada al alias'
+  );
+  assert(
+    approvalPattern({
+      tool: 'open_website',
+      params: { target: 'https://gmail.com/', control: 'managed' },
+    }) === 'open_website:managed:kaoru:gmail.com',
+    'el navegador administrado conserva un consentimiento separado'
+  );
+  assert(
+    approvalPattern({ tool: 'play_media', params: { query: '  Guitarra   acústica ' } }) ===
+      'play_media:managed:kaoru:youtube:guitarra acústica',
+    'play_media → aprobación limitada al servicio y consulta'
+  );
+  assert(
+    approvalPattern({ tool: 'process_stop', params: { pid: 42 } }) === 'process_stop:42',
+    'process_stop → aprobación ligada al PID exacto'
+  );
+  assert(
+    approvalPattern({ tool: 'process_list', params: { query: 'Electron' } }) ===
+      'process_list:electron',
+    'process_list → aprobación ligada al filtro'
+  );
+  assert(
+    approvalPattern({ tool: 'camera_status', params: {} }) === 'camera_status',
+    'cámara → patrón estable'
+  );
+  assert(approvalPattern(null) === null, 'action null → null');
+}
+
+function testSessionAlways() {
+  console.log(C.bold('\n── "Siempre": auto-aprobación de sesión + reset ───────────────'));
+
+  resetApprovals();
+  const p = 'exec:git status';
+  assert(!isApproved(p), 'sin registrar, no está aprobado');
+  addApproval(p);
+  assert(isApproved(p), 'tras "Siempre" queda aprobado');
+  assert(isApproved('exec:git commit') === false, 'otro patrón NO se aprueba');
+  const later = { tool: 'exec', params: { command: 'git status --short' } };
+  assert(isApproved(approvalPattern(later)), 'action posterior con mismo patrón → auto-aprobado');
+  resetApprovals();
+  assert(!isApproved(p), 'reset limpia la sesión');
+}
+
+function main() {
+  console.log(C.bold(C.cyan('\n════════════════════════════════════════════════════════')));
+  console.log(C.bold(C.cyan('  SessionApprovals — Test Suite')));
+  console.log(C.bold(C.cyan('════════════════════════════════════════════════════════')));
+  testApprovalPatterns();
+  testSessionAlways();
+
+  console.log(C.bold('\n════════════════════════════════════════════════════════'));
+  const total = passed + failed;
+  console.log(
+    C.bold(
+      `  Resultado: ${C.green(passed + ' passed')}  ${failed > 0 ? C.red(failed + ' failed') : C.dim('0 failed')}  / ${total} total`
+    )
+  );
+  console.log(C.bold('════════════════════════════════════════════════════════\n'));
+
+  if (failed > 0) process.exit(1);
+}
+
+main();

@@ -1,0 +1,950 @@
+// @ts-nocheck
+/* eslint-disable no-unused-vars */
+// Input
+const input = document.getElementById('msg-input');
+const hintEl = document.getElementById('input-hint-text');
+const inputText = (key) => window.kaoruI18n.t(key);
+const inputFormat = (key, values) => window.kaoruI18n.format(key, values);
+const inputCount = (count, one, many) => inputFormat(count === 1 ? one : many, { count });
+
+// Cursor de terminal: bloque parpadeante que sigue al caret del textarea
+// (se mueve a la izquierda/arriba al escribir). Se posiciona midiendo el
+// texto previo al caret con un espejo oculto del mismo ancho y font que el
+// contenido del textarea (ver .input-mirror y .input-cursor en chat.css).
+const inputCursor = document.getElementById('input-cursor');
+let _inputMirror = null;
+
+function _getInputMirror() {
+  if (_inputMirror) return _inputMirror;
+  _inputMirror = document.createElement('span');
+  _inputMirror.className = 'input-mirror';
+  document.getElementById('input-row').appendChild(_inputMirror);
+  const cs = getComputedStyle(input);
+  _inputMirror.style.fontFamily = cs.fontFamily;
+  _inputMirror.style.fontSize = cs.fontSize;
+  _inputMirror.style.lineHeight = cs.lineHeight;
+  _inputMirror.style.letterSpacing = cs.letterSpacing;
+  return _inputMirror;
+}
+
+function _updateCursor() {
+  if (!inputCursor || document.activeElement !== input) return;
+  const row = document.getElementById('input-row');
+  const rowRect = row.getBoundingClientRect();
+  const inputRect = input.getBoundingClientRect();
+  const padTop = parseFloat(getComputedStyle(input).paddingTop) || 0;
+  const mirror = _getInputMirror();
+  mirror.style.left = inputRect.left - rowRect.left + 'px';
+  mirror.style.top = inputRect.top - rowRect.top + padTop + 'px';
+  mirror.style.width = input.clientWidth + 'px';
+  mirror.textContent = input.value.slice(0, input.selectionStart || 0);
+
+  const range = document.createRange();
+  range.selectNodeContents(mirror);
+  const rects = range.getClientRects();
+  let x = inputRect.left;
+  let y = inputRect.top + padTop;
+  if (rects.length) {
+    const last = rects[rects.length - 1];
+    x = last.right;
+    y = last.top;
+  }
+  inputCursor.style.left = x - rowRect.left + 'px';
+  inputCursor.style.top = y - rowRect.top - input.scrollTop + 'px';
+}
+input.addEventListener('input', _updateCursor);
+input.addEventListener('click', _updateCursor);
+input.addEventListener('focus', _updateCursor);
+input.addEventListener('keyup', _updateCursor);
+document.addEventListener('selectionchange', _updateCursor);
+
+const commandsBtn = document.getElementById('commands-btn');
+if (commandsBtn) {
+  commandsBtn.addEventListener('click', () => {
+    if (!input.value.trim()) {
+      input.value = '/';
+      input.dispatchEvent(new Event('input'));
+    } else {
+      _showCmdSuggestions('');
+    }
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    _updateCursor();
+  });
+}
+
+function updateLlmHint() {
+  // Con sandbox:true el índice de comandos y los providers llegan por caché
+  // (el preload fino los refresca tras configurar el LLM), así que los nombres
+  // de autocompletado se reconstruyen aquí para no quedarse con una lista vacía
+  // del arranque.
+  _cmdNames = [
+    ...CommandRegistry.getNames(),
+    // Atajos de proveedor (/groq, /gemini, /nvidia, ...) — se resuelven en
+    // CommandRegistry.execute() como fallback, así que deben autocompletarse.
+    ...LLMProvider.getAvailableProviders().map((p) => p.id),
+  ];
+  const active = LLMProvider.getActiveProvider();
+  const all = LLMProvider.getAvailableProviders();
+  const p = all.find((x) => x.id === active);
+  if (p) {
+    const cost = inputText(p.free ? 'free' : 'paid');
+    hintEl.textContent = `${p.name} · ${cost}`;
+  } else {
+    hintEl.textContent = inputText('noActiveLlm');
+  }
+  updateHeaderModel();
+  refreshFooterSession();
+}
+document.addEventListener('kaoru-language-changed', () => {
+  updateLlmHint();
+  if (modelBrowser.style.display !== 'none') _mbrRender();
+});
+
+let _atSelectedIdx = -1;
+let _atQuery = '';
+let _cmdSuggested = false;
+
+let _cmdNames = [];
+let _skillNames = [];
+ipcRenderer
+  .invoke('list-skills')
+  .then((skills) => {
+    _skillNames = skills.map((s) => s.name);
+  })
+  .catch(() => {});
+
+// `_atProjectFiles` (cache de @files) se declara en core.js; aquí solo el
+// cache de la promesa de listado (sandbox:true → listProjectFiles es async).
+let _atProjectFilesPromise = null;
+
+function _getProjectFiles(cwd) {
+  if (!_atProjectFilesPromise) {
+    _atProjectFilesPromise = FileResolver.listProjectFiles(cwd)
+      .then((files) => {
+        _atProjectFiles = files || [];
+        return _atProjectFiles;
+      })
+      .catch(() => {
+        _atProjectFiles = [];
+        return _atProjectFiles;
+      });
+  }
+  return _atProjectFilesPromise;
+}
+
+async function _showAtSuggestions(query) {
+  _atQuery = query;
+  const el = document.getElementById('at-suggestions');
+
+  const projectCwd = _workspacePath || (await assistant.cwd().catch(() => null));
+  const files = await _getProjectFiles(projectCwd);
+  if (_atQuery !== query) return; // llegó un keystroke más nuevo mientras tanto
+
+  const filtered = files
+    .filter((f) => f.path.toLowerCase().includes(query.toLowerCase()))
+    .slice(0, 20);
+
+  if (filtered.length === 0) {
+    el.style.display = 'none';
+    return;
+  }
+
+  el.innerHTML = filtered
+    .map(
+      (f, i) =>
+        `<div class="at-suggestion-item" data-index="${i}" data-path="${escapeHtml(f.path)}">
+      <span class="file-icon">${f.type === 'directory' ? '[DIR]' : '[FILE]'}</span>
+      <span>${_highlightMatch(f.name, query)}</span>
+      <span class="file-path">${escapeHtml(f.path.split('/').slice(0, -1).join('/') || '.')}</span>
+    </div>`
+    )
+    .join('');
+  el.style.display = 'block';
+  _atSelectedIdx = -1;
+}
+
+// Antes solo escapaba la rama SIN match (idx === -1) — un nombre de
+// archivo malicioso que SÍ matcheaba la búsqueda pasaba crudo por el resto
+// del string (name.slice antes/después del match), sin pasar por
+// escapeHtml en absoluto. Ahora las tres partes se escapan por separado
+// antes de insertar el <strong> — el <strong> es el único HTML real que
+// se genera acá, todo lo demás es texto del usuario/filesystem.
+function _highlightMatch(name, query) {
+  const idx = name.toLowerCase().indexOf(query.toLowerCase());
+  if (idx === -1) return escapeHtml(name);
+  const before = escapeHtml(name.slice(0, idx));
+  const match = escapeHtml(name.slice(idx, idx + query.length));
+  const after = escapeHtml(name.slice(idx + query.length));
+  return before + '<strong>' + match + '</strong>' + after;
+}
+
+function _applyAtSuggestion(path) {
+  const el = document.getElementById('at-suggestions');
+  el.style.display = 'none';
+
+  const cursorPos = input.selectionStart;
+  const text = input.value;
+  const before = text.slice(0, cursorPos);
+  const after = text.slice(cursorPos);
+
+  const atIdx = before.lastIndexOf('@');
+  if (atIdx === -1) return;
+
+  const newText = before.slice(0, atIdx + 1) + path + after;
+  input.value = newText;
+  const newPos = atIdx + 1 + path.length;
+  input.setSelectionRange(newPos, newPos);
+  input.dispatchEvent(new Event('input'));
+  input.focus();
+}
+
+function _showCmdSuggestions(query) {
+  _cmdSuggested = true;
+  _atQuery = query;
+  const el = document.getElementById('at-suggestions');
+
+  const cmds = _cmdNames
+    .filter((c) => c.toLowerCase().startsWith(query.toLowerCase()))
+    .slice(0, 15);
+
+  if (cmds.length === 0) {
+    el.style.display = 'none';
+    return;
+  }
+
+  el.innerHTML = cmds
+    .map((c, i) => {
+      const command = CommandRegistry.getCommand(c);
+      const description = command && command.description ? command.description : 'Comando de Kaoru';
+      return `<div class="at-suggestion-item command-suggestion" data-index="${i}" data-cmd="${c}">
+        <span class="command-suggestion-name">/${c}</span>
+        <span class="command-suggestion-description">${escapeHtml(description)}</span>
+      </div>`;
+    })
+    .join('');
+  el.style.display = 'block';
+  _atSelectedIdx = -1;
+}
+
+function _applyCmdSuggestion(cmd) {
+  _cmdSuggested = false;
+  const el = document.getElementById('at-suggestions');
+  el.style.display = 'none';
+  input.value = '/' + cmd + ' ';
+  input.focus();
+  const newPos = input.value.length;
+  input.setSelectionRange(newPos, newPos);
+  input.dispatchEvent(new Event('input'));
+}
+
+function _cmdArgCompletions(cmdName) {
+  const cmd = CommandRegistry.getCommand(cmdName);
+  if (!cmd) return null;
+  if (cmdName === 'skill') return _skillNames.length > 0 ? _skillNames : null;
+  if (cmdName === 'cambio-modelo' || cmdName === 'avatar-model')
+    return _modelNames.length > 0 ? _modelNames : null;
+  if (cmdName === 'modelo-vistas' || cmdName === 'avatar-view')
+    return ['full', 'half', 'head', 'all'];
+  return cmd.completions || null;
+}
+
+function _showArgSuggestions(cmdName, partialArg) {
+  const completions = _cmdArgCompletions(cmdName);
+  if (!completions) {
+    document.getElementById('at-suggestions').style.display = 'none';
+    return;
+  }
+
+  const filtered = completions
+    .filter((c) => c.toLowerCase().startsWith(partialArg.toLowerCase()))
+    .slice(0, 15);
+
+  const el = document.getElementById('at-suggestions');
+  if (filtered.length === 0) {
+    el.style.display = 'none';
+    return;
+  }
+
+  el.innerHTML = filtered
+    .map(
+      (c, i) =>
+        `<div class="at-suggestion-item" data-index="${i}" data-cmd-arg="${c}">
+      <span style="color:var(--accent)">${c}</span>
+      <span style="opacity:.5;margin-left:auto;font-size:10px">/${cmdName}</span>
+    </div>`
+    )
+    .join('');
+  el.style.display = 'block';
+  _atSelectedIdx = -1;
+}
+
+function _applyArgSuggestion(arg) {
+  const el = document.getElementById('at-suggestions');
+  el.style.display = 'none';
+
+  const cursorPos = input.selectionStart;
+  const before = input.value.slice(0, cursorPos);
+  const after = input.value.slice(cursorPos);
+
+  const spaceIdx = before.indexOf(' ');
+  const newBefore = before.slice(0, spaceIdx + 1) + arg;
+  input.value = newBefore + after;
+  const newPos = newBefore.length;
+  input.setSelectionRange(newPos, newPos);
+  input.dispatchEvent(new Event('input'));
+  input.focus();
+}
+
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+
+  const cursorPos = input.selectionStart;
+  const textBeforeCursor = input.value.slice(0, cursorPos);
+
+  // /model [filtro] → browser inline con TODOS los modelos (empresa debajo).
+  const modelMatch = textBeforeCursor.match(/^\/model\b(.*)$/s);
+  if (modelMatch && !textBeforeCursor.includes('\n')) {
+    _mbrShow((modelMatch[1] || '').trim());
+    return;
+  }
+  if (modelBrowser.style.display !== 'none') _mbrHide();
+
+  // /command name suggestions: only at start of input, no space yet
+  if (textBeforeCursor.startsWith('/') && !textBeforeCursor.includes(' ')) {
+    _cmdSuggested = true;
+    const query = textBeforeCursor.slice(1);
+    _showCmdSuggestions(query);
+    return;
+  }
+
+  // /command sub-arg suggestions: /cmd partial...
+  if (textBeforeCursor.startsWith('/') && textBeforeCursor.includes(' ')) {
+    _cmdSuggested = false;
+    const afterSlash = textBeforeCursor.slice(1);
+    const spaceIdx = afterSlash.indexOf(' ');
+    const cmdName = afterSlash.slice(0, spaceIdx);
+    const partialArg = afterSlash.slice(spaceIdx + 1);
+    _showArgSuggestions(cmdName, partialArg);
+    return;
+  }
+
+  // @file suggestions
+  _cmdSuggested = false;
+  const atIdx = textBeforeCursor.lastIndexOf('@');
+  if (atIdx === -1 || textBeforeCursor.slice(atIdx).includes(' ')) {
+    document.getElementById('at-suggestions').style.display = 'none';
+    return;
+  }
+  const query = textBeforeCursor.slice(atIdx + 1);
+  _showAtSuggestions(query);
+});
+// ── Browser de modelos inline (/model): TODOS los modelos, empresa debajo ────
+// Al escribir /model el div del input se expande y lista los modelos del
+// catálogo + models.dev (favoritos primero). Enter lo asigna a respuestas
+// El flujo elige automáticamente si la solicitud requiere herramientas.
+// Si el proveedor no está conectado, la fila permite pegar la API key. Esc cierra.
+const modelBrowser = document.getElementById('model-browser');
+const modelBrowserList = document.getElementById('model-browser-list');
+const modelBrowserCount = document.getElementById('model-browser-count');
+const modelBrowserStatus = document.getElementById('model-browser-status');
+
+let _pickerData = null; // cache del payload get-model-picker
+let _browserRows = [];
+let _browserSel = -1;
+let _browserQuery = '';
+let _browserExpanded = null; // { providerId, modelId }
+let _browserShowAll = false; // toggle "ver todos los proveedores"
+let _collapsedGroups = new Set(); // providerIds colapsados
+
+document.addEventListener('llm-credentials-changed', () => {
+  _pickerData = null;
+});
+
+async function _ensurePickerData() {
+  if (_pickerData) return _pickerData;
+  try {
+    _pickerData = await ipcRenderer.invoke('get-model-picker');
+  } catch {
+    _pickerData = null;
+  }
+  return _pickerData;
+}
+
+function _providerById() {
+  return new Map(((_pickerData && _pickerData.providers) || []).map((p) => [p.id, p]));
+}
+
+function _mbrCtx(n) {
+  if (!n) return '';
+  if (n >= 1000000) return `${(n / 1000000).toFixed(1).replace(/\.0$/, '')}M ctx`;
+  if (n >= 1000) return `${Math.round(n / 1000)}k ctx`;
+  return `${n} ctx`;
+}
+
+function _mbrKey(m) {
+  return `${String(m.providerId).toLowerCase()}/${String(m.modelId).toLowerCase()}`;
+}
+
+function _mbrEffortControl(m) {
+  if (!Array.isArray(m.effortOptions) || m.effortOptions.length === 0) return '';
+  const selected = m.reasoningEffort || 'medium';
+  return `<label class="mbr-effort">${inputText('reasoningEffort')}
+    <select class="mbr-effort-select">
+      ${m.effortOptions.map((value) => `<option value="${value}"${value === selected ? ' selected' : ''}>${inputText(value === 'low' ? 'effortLow' : value === 'high' ? 'effortHigh' : 'effortMedium')}</option>`).join('')}
+    </select>
+  </label>`;
+}
+
+function _mbrRowHtml(m, i, byId, favs) {
+  const p = byId.get(m.providerId) || {};
+  const connected = !!p.hasKey;
+  const chips = [];
+  if (m.tools) chips.push('tools');
+  if (m.reasoning) chips.push(inputText('reasoning'));
+  const ctx = _mbrCtx(m.context);
+  if (ctx) chips.push(ctx);
+  const expanded =
+    _browserExpanded &&
+    _browserExpanded.providerId === m.providerId &&
+    _browserExpanded.modelId === m.modelId;
+  const exp = expanded
+    ? `<div class="model-browser-expanded">
+        ${_mbrEffortControl(m)}
+        ${p.doc ? `<a class="mbr-doc" href="${escapeHtml(p.doc)}" target="_blank" rel="noreferrer">${inputText('providerDocs')}</a>` : ''}
+        ${
+          connected
+            ? `<div class="mbr-actions">
+               <button class="mbr-btn" data-act="use">${inputText('useThisModel')}</button>
+             </div>`
+            : p.connectable === false
+              ? `<div style="font-size:10px;color:#f59e0b;font-family:var(--font-mono)">${inputText('cannotAutoConnect')}</div>`
+              : `<input class="mbr-key" type="password" placeholder="${escapeHtml(p.name)} API key" autocomplete="off" />
+             <div class="mbr-actions">
+               <button class="mbr-btn" data-act="connect">${inputText('connectAndUse')}</button>
+             </div>`
+        }
+      </div>`
+    : '';
+  return `<div class="model-browser-row${i === _browserSel ? ' active' : ''}" data-i="${i}">
+    <div class="mbr-name">${favs.has(_mbrKey(m)) ? '<span class="fav">★</span>' : ''}${escapeHtml(m.label)}</div>
+    <div class="mbr-provider"><span class="dot${connected ? ' on' : ''}"></span>${escapeHtml(p.name || m.providerId)}</div>
+    ${chips.length ? `<div class="mbr-chips">${chips.map((c) => `<span class="chip">${escapeHtml(c)}</span>`).join('')}</div>` : ''}
+    ${exp}
+  </div>`;
+}
+
+function _mbrGroupHtml(providerId, p, models, byId, favs) {
+  const collapsed = _collapsedGroups.has(providerId);
+  const body = models
+    .map((m, _k) => {
+      const i = _browserRows.indexOf(m);
+      if (i === -1) return '';
+      return _mbrRowHtml(m, i, byId, favs);
+    })
+    .join('');
+  return `<div class="mbr-group${collapsed ? ' collapsed' : ''}" data-provider="${escapeHtml(providerId)}">
+    <div class="mbr-group-header" role="button">
+      <span class="mbr-group-chevron"></span>
+      <span class="mbr-group-name">${escapeHtml(p.name || providerId)}</span>
+      <span class="mbr-group-count">${inputCount(models.length, 'modelOne', 'modelMany')}</span>
+    </div>
+    <div class="mbr-group-body">${body}</div>
+  </div>`;
+}
+
+function _mbrRender() {
+  if (!_pickerData) return;
+  const q = _browserQuery.toLowerCase();
+  const byId = _providerById();
+  const favs = new Set(_pickerData.favorites || []);
+  // Sin query y sin "ver todos": solo favoritos + proveedores con API key.
+  // Con query o con showAll: catálogo completo (400+ providers de models.dev).
+  const base = q || _browserShowAll ? _pickerData.models : _pickerData.defaultModels || [];
+  let rows = base.filter((m) => {
+    if (!q) return true;
+    const p = byId.get(m.providerId) || {};
+    const aliases = m.providerId === 'openai' ? 'chatgpt gpt' : '';
+    return (
+      m.label.toLowerCase().includes(q) ||
+      m.modelId.toLowerCase().includes(q) ||
+      (p.name || '').toLowerCase().includes(q) ||
+      aliases.includes(q)
+    );
+  });
+  rows.sort(
+    (a, b) =>
+      (favs.has(_mbrKey(a)) ? 0 : 1) - (favs.has(_mbrKey(b)) ? 0 : 1) ||
+      (byId.get(a.providerId)?.hasKey ? 0 : 1) - (byId.get(b.providerId)?.hasKey ? 0 : 1) ||
+      (byId.get(a.providerId)?.builtin ? 0 : 1) - (byId.get(b.providerId)?.builtin ? 0 : 1) ||
+      a.providerId.localeCompare(b.providerId)
+  );
+  if (q) {
+    const seenModels = new Set();
+    rows = rows.filter((m) => {
+      const canonical = String(m.label || m.modelId)
+        .trim()
+        .toLowerCase();
+      if (seenModels.has(canonical)) return false;
+      seenModels.add(canonical);
+      return true;
+    });
+  }
+  // Agrupar por provider preservando el orden (favoritos primero).
+  const groups = [];
+  const groupIdx = new Map();
+  for (const m of rows) {
+    let g = groupIdx.get(m.providerId);
+    if (!g) {
+      g = { providerId: m.providerId, models: [] };
+      groupIdx.set(m.providerId, g);
+      groups.push(g);
+    }
+    g.models.push(m);
+  }
+  // _browserRows = filas de grupos expandidos, para navegación por teclado.
+  _browserRows = [];
+  for (const g of groups) {
+    if (_collapsedGroups.has(g.providerId)) continue;
+    for (const m of g.models) {
+      if (_browserRows.length >= 500) break;
+      _browserRows.push(m);
+    }
+  }
+  if (_browserSel >= _browserRows.length) _browserSel = _browserRows.length - 1;
+  if (_browserExpanded && !_browserRows.some((r) => _mbrKey(r) === _mbrKey(_browserExpanded))) {
+    _browserExpanded = null;
+  }
+  const connected = (_pickerData.providers || []).filter((p) => p.hasKey).length;
+  const total = _pickerData.models.length;
+  const hidden = _pickerData.remoteHidden || null;
+  const hiddenNote =
+    hidden && hidden.providers > 0
+      ? inputFormat('hiddenRemoteProviders', {
+          count: hidden.providers,
+          total: _pickerData.providers.length,
+        })
+      : '';
+  const toggleBtn = document.getElementById('mbr-toggle-all');
+  toggleBtn.style.display = q ? 'none' : 'inline-block';
+  toggleBtn.textContent = inputText(_browserShowAll ? 'showOnlyConnected' : 'showAllProviders');
+  if (q) {
+    modelBrowserCount.textContent = inputFormat('modelsOfTotal', {
+      shown: rows.length,
+      total,
+      note: hiddenNote,
+    });
+  } else if (_browserShowAll) {
+    modelBrowserCount.textContent = inputCount(total, 'modelOne', 'modelMany') + hiddenNote;
+  } else {
+    modelBrowserCount.textContent =
+      inputCount(connected, 'providerOne', 'providerMany') + hiddenNote;
+  }
+  modelBrowserList.innerHTML = groups
+    .map((g) => _mbrGroupHtml(g.providerId, byId.get(g.providerId) || {}, g.models, byId, favs))
+    .join('');
+  if (q) {
+    modelBrowserStatus.textContent =
+      rows.length > _browserRows.length
+        ? inputFormat('resultsLimited', { shown: _browserRows.length, total: rows.length })
+        : inputText('browserNavigateSelect');
+  } else if (_browserShowAll) {
+    modelBrowserStatus.textContent = inputFormat('fullCatalog', { count: total });
+  } else {
+    modelBrowserStatus.textContent = inputFormat('browserSearchHint', { count: total });
+  }
+  modelBrowserStatus.style.color = 'var(--text-secondary)';
+}
+
+function _mbrScrollActive() {
+  const el = modelBrowserList.querySelector('.model-browser-row.active');
+  if (el) el.scrollIntoView({ block: 'nearest' });
+}
+
+async function _mbrShow(query) {
+  _browserQuery = query;
+  modelBrowser.style.display = 'flex';
+  document.getElementById('at-suggestions').style.display = 'none';
+  await _ensurePickerData();
+  _mbrRender();
+}
+
+function _mbrHide() {
+  modelBrowser.style.display = 'none';
+  _browserRows = [];
+  _browserSel = -1;
+  _browserExpanded = null;
+  _browserQuery = '';
+  _browserShowAll = false;
+  _collapsedGroups.clear();
+}
+
+function _mbrMove(delta) {
+  if (!_browserRows.length) return;
+  _browserSel = (_browserSel + delta + _browserRows.length) % _browserRows.length;
+  _mbrRender();
+  _mbrScrollActive();
+}
+
+function _mbrToggleExpand(row) {
+  const key = _mbrKey(row);
+  _browserExpanded = _browserExpanded && _mbrKey(_browserExpanded) === key ? null : row;
+  _mbrRender();
+  const keyInput = modelBrowserList.querySelector('.mbr-key');
+  if (keyInput) keyInput.focus();
+}
+
+async function _mbrApplyConnected(row) {
+  const mode = 'all';
+  const effortSelect = modelBrowserList.querySelector('.mbr-effort-select');
+  const reasoningEffort = effortSelect ? effortSelect.value : row.reasoningEffort;
+  const saved = await ipcRenderer.invoke('set-llm-model', {
+    provider: row.providerId,
+    mode,
+    model: row.modelId,
+    reasoningEffort,
+  });
+  if (!saved) {
+    modelBrowserStatus.textContent = inputText('modelSaveFailed');
+    return;
+  }
+  if (reasoningEffort) row.reasoningEffort = reasoningEffort;
+  await loadLLMConfig();
+  modelBrowserStatus.textContent = `${inputFormat('modelActive', { model: row.label })}${row.tools === false ? ` · ${inputText('noTools')}` : ''}`;
+  modelBrowserStatus.style.color = '#10b981';
+  input.value = '';
+  input.style.height = 'auto';
+  setTimeout(_mbrHide, 700);
+}
+
+async function _mbrConnectAndUse(row) {
+  const mode = 'all';
+  const keyInput = modelBrowserList.querySelector('.mbr-key');
+  const apiKey = keyInput ? keyInput.value.trim() : '';
+  if (!apiKey) {
+    modelBrowserStatus.textContent = inputText('pasteApiKey');
+    modelBrowserStatus.style.color = '#f59e0b';
+    return;
+  }
+  modelBrowserStatus.textContent = inputText('connectingShort');
+  modelBrowserStatus.style.color = 'var(--text-secondary)';
+  const res = await ipcRenderer.invoke('connect-llm-provider', {
+    providerId: row.providerId,
+    apiKey,
+    modelId: row.modelId,
+    mode,
+    useKeychain: document.getElementById('use-keychain').checked,
+  });
+  if (!res.ok) {
+    modelBrowserStatus.textContent = `${inputText('connectFailed')}: ${res.error || inputText('connectFailed')}`;
+    modelBrowserStatus.style.color = '#ef4444';
+    return;
+  }
+  const effortSelect = modelBrowserList.querySelector('.mbr-effort-select');
+  if (effortSelect) {
+    await ipcRenderer.invoke('set-llm-model', {
+      provider: row.providerId,
+      mode,
+      model: row.modelId,
+      reasoningEffort: effortSelect.value,
+    });
+    row.reasoningEffort = effortSelect.value;
+  }
+  await loadLLMConfig();
+  _mbrHide();
+  input.value = '';
+  input.style.height = 'auto';
+}
+
+function _mbrEnter(row) {
+  const p = _providerById().get(row.providerId) || {};
+  if (p.hasKey) _mbrApplyConnected(row);
+  else _mbrToggleExpand(row);
+}
+
+input.addEventListener('keydown', (e) => {
+  if (modelBrowser.style.display !== 'none') {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      _mbrMove(1);
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      _mbrMove(-1);
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      // Enter usa la fila seleccionada (o la primera si no hay selección).
+      // Si se escribió un comando directo (/model <provider> <modelo> [rol])
+      // se deja pasar para que lo procese el comando.
+      const row = _browserSel >= 0 ? _browserRows[_browserSel] : _browserRows[0];
+      const isDirect = _browserQuery.split(/\s+/).length >= 2;
+      if (row && (_browserSel >= 0 || !isDirect)) {
+        e.preventDefault();
+        _mbrEnter(row);
+        return;
+      }
+      if (_browserSel >= 0) {
+        e.preventDefault();
+        return;
+      }
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      _mbrHide();
+      return;
+    }
+  }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    const atEl = document.getElementById('at-suggestions');
+    if (atEl.style.display === 'block') {
+      e.preventDefault();
+      const selected = atEl.querySelector('.at-suggestion-item.selected');
+      if (selected) {
+        if (_cmdSuggested) {
+          _applyCmdSuggestion(selected.dataset.cmd);
+        } else if (selected.dataset.cmdArg) {
+          _applyArgSuggestion(selected.dataset.cmdArg);
+        } else {
+          _applyAtSuggestion(selected.dataset.path);
+        }
+        return;
+      }
+    }
+    // Clear command suggestion state on send
+    _cmdSuggested = false;
+    e.preventDefault();
+    const text = input.value;
+    input.value = '';
+    input.style.height = 'auto';
+    document.getElementById('at-suggestions').style.display = 'none';
+    sendMessage(text);
+  }
+  if (e.key === 'Tab' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    const atEl = document.getElementById('at-suggestions');
+    if (atEl.style.display !== 'block') {
+      // En el flujo unificado Tab ya no alterna un pipeline oculto. Sin
+      // sugerencias, conserva el comportamiento normal de foco del navegador.
+      return;
+    }
+    e.preventDefault();
+    const items = atEl.querySelectorAll('.at-suggestion-item');
+    if (items.length === 0) return;
+    if (e.key === 'Tab' || e.key === 'ArrowDown') {
+      _atSelectedIdx = (_atSelectedIdx + 1) % items.length;
+    } else {
+      _atSelectedIdx = (_atSelectedIdx - 1 + items.length) % items.length;
+    }
+    items.forEach((el, i) => el.classList.toggle('selected', i === _atSelectedIdx));
+    if (items[_atSelectedIdx]) items[_atSelectedIdx].scrollIntoView({ block: 'nearest' });
+  }
+  if (e.key === 'Escape') {
+    _cmdSuggested = false;
+    document.getElementById('at-suggestions').style.display = 'none';
+  }
+});
+// Click handler for @ and / suggestions
+document.getElementById('at-suggestions').addEventListener('mousedown', (e) => {
+  const item = e.target.closest('.at-suggestion-item');
+  if (!item) return;
+  e.preventDefault();
+  if (_cmdSuggested) {
+    _applyCmdSuggestion(item.dataset.cmd);
+  } else if (item.dataset.cmdArg) {
+    _applyArgSuggestion(item.dataset.cmdArg);
+  } else {
+    _applyAtSuggestion(item.dataset.path);
+  }
+});
+
+// Click handler del browser de modelos inline
+modelBrowserList.addEventListener('mousedown', async (e) => {
+  e.preventDefault();
+  const groupHeader = e.target.closest('.mbr-group-header');
+  if (groupHeader) {
+    const group = groupHeader.closest('.mbr-group');
+    const pid = group ? group.dataset.provider : '';
+    if (pid) {
+      if (_collapsedGroups.has(pid)) _collapsedGroups.delete(pid);
+      else _collapsedGroups.add(pid);
+      _mbrRender();
+    }
+    return;
+  }
+  const btn = e.target.closest('.mbr-btn');
+  if (btn) {
+    const row = _browserExpanded;
+    if (row && btn.dataset.act === 'use') await _mbrApplyConnected(row);
+    else if (row) await _mbrConnectAndUse(row);
+    return;
+  }
+  const rowEl = e.target.closest('.model-browser-row');
+  if (!rowEl) return;
+  const i = Number(rowEl.dataset.i);
+  if (Number.isNaN(i) || !_browserRows[i]) return;
+  _browserSel = i;
+  const row = _browserRows[i];
+  const p = _providerById().get(row.providerId) || {};
+  if (p.hasKey && Array.isArray(row.effortOptions) && row.effortOptions.length > 0) {
+    _mbrToggleExpand(row);
+  } else if (p.hasKey) await _mbrApplyConnected(row);
+  else _mbrToggleExpand(row);
+});
+
+document.getElementById('mbr-toggle-all').addEventListener('click', () => {
+  _browserShowAll = !_browserShowAll;
+  _mbrRender();
+});
+function sendMessage(text) {
+  const files = [...pendingFiles];
+  clearAttachments();
+  const context = window.takeTerminalContext?.();
+  window.pendingTerminalAnchor = context?.anchor || null;
+  window.activeTerminalAnswerAnchor = context?.anchor || null;
+  processMessage(text + (context?.text || ''), files);
+}
+
+// Adjuntos
+const attachBtn = document.getElementById('attach-btn');
+const fileInput = document.getElementById('file-input');
+const attachBar = document.getElementById('attachments-bar');
+
+// Adjuntar desde el compositor o mediante drag & drop.
+if (attachBtn) attachBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => addFiles(Array.from(e.target.files)));
+
+function addFiles(files) {
+  files.forEach((f) => {
+    if (!pendingFiles.find((p) => p.name === f.name && p.size === f.size)) pendingFiles.push(f);
+  });
+  renderAttachBar();
+  fileInput.value = '';
+}
+function renderAttachBar() {
+  attachBar.innerHTML = '';
+  if (!pendingFiles.length) {
+    attachBar.classList.remove('has-files');
+    return;
+  }
+  attachBar.classList.add('has-files');
+  pendingFiles.forEach((f, i) => {
+    const chip = document.createElement('div');
+    chip.className = 'attach-chip';
+    chip.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66L9.41 17.41a2 2 0 01-2.83-2.83l8.49-8.48"/></svg><span class="chip-name">${escapeHtml(f.name)}</span><div class="chip-del" data-idx="${i}">X</div>`;
+    attachBar.appendChild(chip);
+  });
+  attachBar.querySelectorAll('.chip-del').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      pendingFiles.splice(Number(btn.dataset.idx), 1);
+      renderAttachBar();
+    })
+  );
+}
+function clearAttachments() {
+  pendingFiles = [];
+  renderAttachBar();
+}
+
+const chatPanel = document.getElementById('chat-panel');
+const dropOverlay = document.getElementById('drop-overlay');
+let dragCounter = 0;
+chatPanel.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  dragCounter++;
+  if (e.dataTransfer.types.includes('Files')) dropOverlay.classList.add('visible');
+});
+chatPanel.addEventListener('dragleave', () => {
+  dragCounter--;
+  if (dragCounter <= 0) {
+    dragCounter = 0;
+    dropOverlay.classList.remove('visible');
+  }
+});
+chatPanel.addEventListener('dragover', (e) => e.preventDefault());
+chatPanel.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  dropOverlay.classList.remove('visible');
+  const files = Array.from(e.dataTransfer.files);
+  if (!files.length) return;
+  let folder = null;
+  for (const f of files) {
+    if (!f.path) continue;
+    try {
+      if (await assistant.statIsDir(f.path)) {
+        folder = f;
+        break;
+      }
+    } catch {}
+  }
+  if (folder) {
+    importModelFromFolder(folder.path);
+    return;
+  }
+  addFiles(files);
+});
+
+async function importModelFromFolder(folderPath) {
+  const res = await ipcRenderer.invoke('model-import', { folderPath });
+  if (res.error) {
+    addMessage('assistant', inputFormat('errorImportingModel', { error: res.error }));
+    return;
+  }
+  addMessage('assistant', inputFormat('modelImported', { name: res.info.name }));
+}
+
+// ── Copiar al seleccionar ───────────────────────────────────────────────────
+// Seleccionar texto en el chat lo copia automáticamente al portapapeles y
+// muestra un toast "Copiado" en la parte superior. Se escucha la selección en
+// el área de mensajes (no en inputs, donde el usuario edita).
+let _copyToastTimer = 0;
+let _lastCopyText = '';
+
+function _showCopyToast() {
+  const toast = document.getElementById('copy-toast');
+  if (!toast) return;
+  toast.classList.add('visible');
+  clearTimeout(_copyToastTimer);
+  _copyToastTimer = setTimeout(() => toast.classList.remove('visible'), 1500);
+}
+
+function _copySelection() {
+  const sel = window.getSelection();
+  const text = sel ? sel.toString() : '';
+  if (!text || !text.trim()) return;
+  if (text === _lastCopyText) return; // no repetir el mismo clic
+  _lastCopyText = text;
+  const onDone = () => {
+    _showCopyToast();
+    // El texto copiado cambia cuando el usuario selecciona otra cosa.
+    setTimeout(() => {
+      _lastCopyText = '';
+    }, 600);
+  };
+  const doCopy = () =>
+    navigator.clipboard
+      .writeText(text)
+      .then(onDone)
+      .catch(() => {});
+  if (navigator.clipboard) {
+    doCopy();
+  } else {
+    // Fallback sin API clipboard: selección + execCommand.
+    document.execCommand('copy');
+    onDone();
+  }
+}
+
+document.addEventListener('mouseup', (e) => {
+  // Solo copiar cuando la selección nace del área de mensajes, no de inputs.
+  if (e.target && e.target.closest && e.target.closest('#messages')) {
+    _copySelection();
+  }
+});
+// Ctrl/Cmd+C también muestra el toast (el navegador ya copia).
+document.addEventListener('copy', (_e) => {
+  const sel = window.getSelection();
+  if (sel && sel.toString() && sel.toString().trim()) _showCopyToast();
+});

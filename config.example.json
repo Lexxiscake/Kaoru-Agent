@@ -1,0 +1,37 @@
+{
+  "activeModel": "March 7th",
+  "llm": {
+    "primary": "groq",
+    "apiKeys": {
+      "groq": "",
+      "gemini": "",
+      "openai": ""
+    },
+    "fallback": ["gemini", "openai"]
+  },
+  "autonomy": "suggest",
+  "sensors": {
+    "git": true,
+    "system": true,
+    "title": true,
+    "clipboard": false,
+    "events": true,
+    "lsp": true
+  },
+  "gestures": {
+    "enabled": true,
+    "cooldownMs": 15000,
+    "minIntervalMs": 2500,
+    "durationMs": 6000,
+    "ambient": false,
+    "ambientIntervalMs": 60000,
+    "forcedMoodFallback": "default",
+    "llmDriven": true,
+    "mappings": {}
+  },
+  "agent": {
+    "verify": {
+      "command": ""
+    }
+  }
+}

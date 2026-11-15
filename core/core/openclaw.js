@@ -1,0 +1,284 @@
+// @ts-nocheck
+const logger = require('../observability/Logger.js');
+// openclaw.js — ciclo de vida del servidor local de tools (kaoru-tool-host.js):
+// arranque con allowed-path, watchdog de disponibilidad, parada ordenada y
+// limpieza de procesos huérfanos.
+
+const path = require('path');
+const crypto = require('crypto');
+const cp = require('child_process');
+const fs = require('fs');
+
+const { getLocalToolBridge } = require('../planner/LocalToolBridge.js');
+const { getProjectCWD } = require('../planner/Planner.js');
+
+const state = require('./state.js');
+
+// Windows compila el pequeño launcher nativo de AppContainer al arrancar.
+// Darle hasta dos minutos, incluso en equipos lentos o con antivirus activo.
+const OPENCLAW_RETRIES = process.platform === 'win32' ? 300 : 15;
+const OPENCLAW_RETRY_MS = 400;
+
+// ── Limpieza de procesos huérfanos ──────────────────────────────────────────
+// Los servidores externos (LSP) se lanzan vía `npx`, que re-ejecuta el
+// paquete en un proceso hijo. Matar `npx` deja el servidor real corriendo.
+// Estas funciones recorren /proc, encuentran los descendientes del proceso
+// actual (que no sean Electron) y les envían la señal pedida, para que al
+// cerrar la app no quede nada vivo.
+function descendantPids(rootPid) {
+  const children = new Map(); // ppid -> [pid, ...]
+  try {
+    for (const entry of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(entry)) continue;
+      let ppid = -1;
+      try {
+        const stat = fs.readFileSync(`/proc/${entry}/stat`, 'utf-8');
+        const close = stat.lastIndexOf(')');
+        const after = stat
+          .slice(close + 1)
+          .trim()
+          .split(/\s+/);
+        ppid = parseInt(after[1], 10);
+      } catch (_) {
+        /* parseo de ps falla en algunos SOs */
+      }
+      if (!children.has(ppid)) children.set(ppid, []);
+      children.get(ppid).push(parseInt(entry, 10));
+    }
+  } catch (_) {
+    logger.debug('openclaw', 'ps listing falló, usando método alternativo');
+    return [];
+  }
+
+  const out = [];
+  const stack = [...(children.get(rootPid) || [])];
+  while (stack.length) {
+    const pid = stack.pop();
+    out.push(pid);
+    stack.push(...(children.get(pid) || []));
+  }
+  return out;
+}
+
+function isElectronProcess(pid) {
+  try {
+    return /electron/i.test(fs.readlinkSync(`/proc/${pid}/exe`));
+  } catch (_) {
+    return true;
+  }
+}
+
+function killDescendants(signal) {
+  let n = 0;
+  for (const pid of descendantPids(process.pid)) {
+    if (isElectronProcess(pid)) continue;
+    try {
+      process.kill(pid, signal);
+      n++;
+    } catch (_) {}
+  }
+  return n;
+}
+
+// ── OpenClaw Server ────────────────────────────────────────────────────────────
+
+// Payload uniforme del evento 'openclaw:available'. Incluye el estado de
+// aislamiento de proceso (bwrap) que el server reporta en /health, para que
+// el renderer muestre el aviso persistente cuando no hay sandbox.
+function _statusPayload(available) {
+  const sandbox = getLocalToolBridge().getSandboxStatus?.() || null;
+  return {
+    available,
+    sandbox: sandbox ? sandbox.enabled : null,
+    sandboxReason: sandbox ? sandbox.reason : null,
+  };
+}
+
+function startOpenClaw(workspacePath) {
+  const serverPath = path.join(__dirname, '..', '..', 'kaoru-tool-host.js');
+  if (!fs.existsSync(serverPath)) {
+    logger.warn('openclaw', '[core] kaoru-tool-host.js no encontrado — herramientas desactivadas');
+    state.bus.emit('openclaw:available', _statusPayload(false));
+    return;
+  }
+
+  if (state.openclawStarting) {
+    logger.warn('openclaw', '[core] OpenClaw ya está iniciando — ignorando');
+    return;
+  }
+  state.openclawStarting = true;
+  state.openclawWorkspace = workspacePath ? path.resolve(workspacePath) : null;
+
+  // Generar API key para el tool host y pasarla vía entorno
+  const apiKey = crypto.randomBytes(32).toString('hex');
+
+  // Pasar el workspace como PATH permitido (evita "cwd outside allowed path")
+  const allowedPath = workspacePath ? path.resolve(workspacePath) : getProjectCWD();
+
+  // Auditoría persistente del servidor de tools en userData (si hay app)
+  const auditDir = state.app
+    ? path.join(state.app.getPath('userData'), 'audit')
+    : path.join(require('os').tmpdir(), 'asistente-vtuber-audit');
+  const auditPath = path.join(auditDir, 'openclaw.jsonl');
+
+  try {
+    const { safeChildEnv } = require('../utils/childEnv.js');
+    state.openclawProcess = cp.fork(serverPath, [], {
+      stdio: 'pipe',
+      env: safeChildEnv({
+        KAORU_TOOL_HOST_API_KEY: apiKey,
+        KAORU_TOOL_HOST_ALLOWED_PATH: allowedPath,
+        KAORU_TOOL_HOST_AUDIT_PATH: auditPath,
+        OPENCLAW_API_KEY: apiKey,
+        OPENCLAW_ALLOWED_PATH: allowedPath,
+        OPENCLAW_AUDIT_PATH: auditPath,
+      }),
+    });
+    const launchedProcess = state.openclawProcess;
+
+    // No dejar la API key en el env del proceso padre
+    delete process.env.OPENCLAW_API_KEY;
+    // Entregar la key al bridge en memoria (el bridge la lee por request)
+    try {
+      require('../planner/LocalToolBridge.js').setApiKey(apiKey);
+    } catch (_) {}
+
+    state.openclawProcess.stdout?.on('data', (d) => {
+      const msg = d.toString().trim();
+      if (msg) logger.info('openclaw', '[tool-host]', msg);
+    });
+
+    state.openclawProcess.stderr?.on('data', (d) => {
+      const msg = d.toString().trim();
+      if (msg) logger.error('openclaw', '[tool-host]', msg);
+    });
+
+    state.openclawProcess.on('exit', (_code) => {
+      if (state.openclawProcess !== launchedProcess) return;
+      state.openclawStarting = false;
+      state.openclawProcess = null;
+      getLocalToolBridge().resetAvailabilityCache();
+      state.bus.emit('openclaw:available', _statusPayload(false));
+    });
+
+    state.openclawProcess.on('error', (_err) => {
+      if (state.openclawProcess !== launchedProcess) return;
+      state.openclawStarting = false;
+      state.openclawProcess = null;
+      state.bus.emit('openclaw:available', _statusPayload(false));
+    });
+
+    let retries = 0;
+    const check = () => {
+      state.openclawCheckTimer = null;
+      retries++;
+      getLocalToolBridge().resetAvailabilityCache();
+      getLocalToolBridge()
+        .isAvailable()
+        .then((available) => {
+          if (available) {
+            logger.info('openclaw', '[core] OpenClaw listo — Fase 3 activa');
+            state.bus.emit('openclaw:available', _statusPayload(true));
+          } else if (retries < OPENCLAW_RETRIES) {
+            state.openclawCheckTimer = setTimeout(check, OPENCLAW_RETRY_MS);
+          } else {
+            logger.warn(
+              'openclaw',
+              `[core] OpenClaw no respondió después de ${OPENCLAW_RETRIES} intentos`
+            );
+            state.openclawProcess?.kill();
+            state.openclawStarting = false;
+            state.openclawProcess = null;
+            state.bus.emit('openclaw:available', _statusPayload(false));
+          }
+        })
+        .catch(() => {
+          if (retries < OPENCLAW_RETRIES)
+            state.openclawCheckTimer = setTimeout(check, OPENCLAW_RETRY_MS);
+          else {
+            state.openclawStarting = false;
+            state.bus.emit('openclaw:available', _statusPayload(false));
+          }
+        });
+    };
+
+    if (process.platform === 'win32' && process.env.OPENCLAW_SANDBOX !== '0') {
+      logger.info(
+        'openclaw',
+        '[core] esperando al tool host (el self-test de AppContainer puede tardar la primera vez)...'
+      );
+    }
+    state.openclawCheckTimer = setTimeout(check, 1500);
+  } catch (e) {
+    state.openclawStarting = false;
+    logger.error('openclaw', '[core] error iniciando OpenClaw:', e.message);
+    state.bus.emit('openclaw:available', _statusPayload(false));
+  }
+}
+
+function stopOpenClaw() {
+  const proc = state.openclawProcess;
+  if (state.openclawKillTimer) {
+    clearTimeout(state.openclawKillTimer);
+    state.openclawKillTimer = null;
+  }
+  if (state.openclawCheckTimer) {
+    clearTimeout(state.openclawCheckTimer);
+    state.openclawCheckTimer = null;
+  }
+  if (proc) {
+    logger.info('openclaw', '[core] deteniendo OpenClaw...');
+    state.openclawProcess = null;
+    state.openclawStarting = false;
+    try {
+      for (const pid of descendantPids(proc.pid)) {
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch (_) {}
+      }
+      proc.kill('SIGTERM');
+      state.openclawKillTimer = setTimeout(() => {
+        try {
+          proc.kill('SIGKILL');
+        } catch (_) {}
+        state.openclawKillTimer = null;
+      }, 3000);
+    } catch (e) {
+      logger.warn('openclaw', '[core] error deteniendo OpenClaw:', e.message);
+    }
+  }
+  getLocalToolBridge().resetAvailabilityCache();
+}
+
+/**
+ * FIX (auditoría Fase D): al cambiar de workspace, OpenClaw debe servir el
+ * nuevo path permitido. Si el server corre con el path inicial, los comandos
+ * del nuevo proyecto serían rechazados en silencio ("cwd outside allowed path").
+ */
+function restartOpenClawForWorkspace(ws) {
+  const resolved = path.resolve(ws);
+  if (state.openclawWorkspace === resolved) return; // mismo workspace → no tocar nada
+  if (state.openclawProcess || state.openclawStarting) {
+    logger.info(
+      'openclaw',
+      '[core] workspace cambió — reiniciando OpenClaw para el nuevo allowed path'
+    );
+    try {
+      stopOpenClaw();
+    } catch (e) {
+      logger.warn('openclaw', '[core] falló al detener OpenClaw:', e && e.message ? e.message : e);
+    }
+  }
+  if (!state.openclawProcess && !state.openclawStarting) {
+    startOpenClaw(resolved);
+  }
+}
+
+module.exports = {
+  startOpenClaw,
+  stopOpenClaw,
+  restartOpenClawForWorkspace,
+  descendantPids,
+  isElectronProcess,
+  killDescendants,
+};

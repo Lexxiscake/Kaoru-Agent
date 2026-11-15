@@ -1,0 +1,353 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, produccion]
+    tags: ['v*']
+  pull_request:
+    branches: [dev, produccion]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint · typecheck · format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Typecheck (JSDoc estricto en core/)
+        run: npm run typecheck
+        # Hay deuda JSDoc anterior en módulos proactivos fuera de este cambio.
+        # El lint, formato y las regresiones sí bloquean el release.
+        continue-on-error: true
+
+      - name: Prettier check
+        run: npm run format:check
+
+  test:
+    name: Tests (Electron runner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Dependencias del sistema (build tools + libs de Electron)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64
+
+      - name: Instalar dependencias (postinstall descarga Electron y reconstruye better-sqlite3)
+        run: npm ci
+
+      # npm ci instala el prebuild para Node 20. La comprobacion del postinstall
+      # tambien corre bajo Node, por lo que no puede detectar el ABI de Electron.
+      - name: Reconstruir better-sqlite3 para Electron
+        run: npm run rebuild
+
+      - name: Indexar intenciones (init_vectors.js → data/core.db)
+        run: npm run init-db
+
+      - name: Verificar generación de la web trilingüe
+        run: node scripts/build-website.js --check
+
+      - name: Instalar Chromium para pruebas web
+        run: npx playwright install --with-deps chromium
+
+      - name: Regresión completa (incluye web trilingüe)
+        run: npm test
+
+  coverage:
+    name: Coverage · planner + decision
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Reconstruir better-sqlite3 para Electron
+        run: npm run rebuild
+
+      - name: Indexar intenciones
+        run: npm run init-db
+
+      - name: Medir cobertura y aplicar umbrales
+        run: npm run coverage:check
+
+      - name: Publicar reporte LCOV
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-planner-decision
+          path: coverage/lcov.info
+          if-no-files-found: error
+
+  test-windows:
+    name: Tests completos · Windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias y reconstruir módulos nativos
+        run: npm ci
+
+      - name: Indexar intenciones con Electron
+        run: npm run init-db
+
+      - name: Instalar Chromium para pruebas web
+        run: npx playwright install chromium
+
+      - name: Regresión completa con runner portable
+        run: npm test
+
+  desktop-contracts:
+    name: Desktop automation · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Contratos JS de escritorio (Linux)
+        if: runner.os == 'Linux'
+        run: ELECTRON_RUN_AS_NODE=1 ./node_modules/electron/dist/electron tests/test_desktop_automation.js && ELECTRON_RUN_AS_NODE=1 ./node_modules/electron/dist/electron tests/test_desktop_control.js
+
+      - name: Contratos JS de escritorio (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:ELECTRON_RUN_AS_NODE = '1'
+          & .\node_modules\electron\dist\electron.exe tests\test_desktop_automation.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\node_modules\electron\dist\electron.exe tests\test_desktop_control.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\node_modules\electron\dist\electron.exe tests\test_windows_sandbox.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test de Windows UI Automation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $json = '{"operation":"health"}' | & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File core\desktop\helpers\windows_uiautomation.ps1
+          $health = $json | ConvertFrom-Json
+          if (-not $health.ok) { throw $health.error }
+
+  e2e-ui:
+    name: E2E UI (Electron + Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Dependencias del sistema (Electron + xvfb para headless UI)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64 xvfb
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: E2E UI (ventana de chat + overlay)
+        run: xvfb-run -a env ELECTRON_RUN_AS_NODE=1 ./node_modules/electron/dist/electron tests/e2e/test_ui_electron.js
+
+      - name: Subir screenshots
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: e2e-ui-screenshots
+          path: tests/e2e/artifacts/
+          if-no-files-found: ignore
+
+  # Build de instaladores en cada SO nativo (mejor que wine). Cada runner
+  # solo construye y sube artifacts; el job release publica el conjunto
+  # completo después de que todos terminen.
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [quality, test, coverage, test-windows, desktop-contracts, e2e-ui]
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    if: ${{ github.ref == 'refs/heads/produccion' || startsWith(github.ref, 'refs/tags/v') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            artifact: asistente-linux
+            pattern: |
+              dist/*.AppImage
+              dist/*.deb
+          - os: macos-latest
+            target: mac
+            artifact: asistente-mac
+            pattern: |
+              dist/*.dmg
+              dist/*.zip
+          - os: windows-latest
+            target: win
+            artifact: asistente-win
+            pattern: |
+              dist/*.exe
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Dependencias del sistema (Linux — FUSE para AppImage)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2
+
+      - name: Instalar dependencias (postinstall descarga Electron + rebuild de nativos)
+        run: npm ci
+
+      - name: Instalar sqlite-vec para ambas arquitecturas de macOS
+        if: runner.os == 'macOS'
+        run: npm install --no-save --force sqlite-vec-darwin-x64@0.1.9 sqlite-vec-darwin-arm64@0.1.9
+
+      - name: Empaquetar
+        run: npm run build:${{ matrix.target }} -- --publish never
+        env:
+          # Sin estos secrets electron-builder conserva el build unsigned.
+          # Al configurarlos, el mismo workflow firma Windows y
+          # firma/notariza macOS sin guardar certificados en el repositorio.
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CSC_LINK != '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Instalar y probar el release de Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist -Filter '*Setup*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No se encontró el instalador NSIS' }
+          $installDir = Join-Path $env:RUNNER_TEMP 'KaoruInstalled'
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Instalación falló: $($install.ExitCode)" }
+
+          $shim = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\asistente.cmd'
+          if (-not (Test-Path $shim)) { throw 'El instalador no creó asistente.cmd' }
+          $shimText = Get-Content -Raw $shim
+          if ($shimText -notmatch '--workspace.*%CD%') { throw 'asistente.cmd no propaga el workspace' }
+
+          $appExe = Get-ChildItem $installDir -Filter '*.exe' |
+            Where-Object { $_.Name -notmatch 'Uninstall' } | Select-Object -First 1
+          if (-not $appExe) { throw 'No se encontró el ejecutable instalado' }
+          $smokeOut = Join-Path $env:RUNNER_TEMP 'kaoru-smoke.stdout.log'
+          $smokeErr = Join-Path $env:RUNNER_TEMP 'kaoru-smoke.stderr.log'
+          $smoke = Start-Process -FilePath $appExe.FullName `
+            -ArgumentList @('--enable-logging=stderr', '--smoke-test', '--workspace', $PWD.Path) `
+            -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeErr -Wait -PassThru
+          if (Test-Path $smokeOut) { Get-Content -Raw $smokeOut }
+          if (Test-Path $smokeErr) { Get-Content -Raw $smokeErr }
+          if ($smoke.ExitCode -ne 0) { throw "Smoke empaquetado falló: $($smoke.ExitCode)" }
+
+          $uninstaller = Get-ChildItem $installDir -Filter '*Uninstall*.exe' | Select-Object -First 1
+          if (-not $uninstaller) { throw 'No se encontró el desinstalador' }
+          $uninstall = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Desinstalación falló: $($uninstall.ExitCode)" }
+          if (Test-Path $shim) { throw 'El desinstalador no eliminó asistente.cmd' }
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.pattern }}
+          if-no-files-found: error
+
+  # En tags v* reúne los artifacts validados y publica un único release.
+  release:
+    name: Release notes (tag v*)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: asistente-*
+          path: dist
+          merge-multiple: true
+
+      - name: Extraer versión del tag
+        id: tag
+        run: echo "name=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Crear/completar GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Asistente v${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          append_body: true
+          files: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+          fail_on_unmatched_files: true

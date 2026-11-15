@@ -1,0 +1,313 @@
+{
+  "lang": "en",
+  "name": "English",
+  "title": "Kaoru — Personal AI assistant with agent capabilities",
+  "description": "Talk, keep context and delegate coding and desktop tasks with Kaoru, a personal AI assistant with tools, memory, voice and a Live2D presence.",
+  "nav": [
+    "What it can do",
+    "Workflow",
+    "Security",
+    "Requirements",
+    "User guide"
+  ],
+  "pages": {
+    "index": "Home",
+    "guide": "User guide",
+    "privacy": "Privacy",
+    "terms": "Terms and license"
+  },
+  "skip": "Skip to content",
+  "theme": "Change theme",
+  "menu": "Open navigation",
+  "language": "Language",
+  "source": "Source code",
+  "start": "Get started with Kaoru",
+  "explore": "Discover what it can do",
+  "badge": "Open source · Personal assistant with agent capabilities",
+  "hero": "Your AI assistant<br>for code and desktop.",
+  "intro": "Kaoru talks with you, remembers context and stays with you through text, voice and a Live2D presence. It can also work as an agent: investigate your project or chain results across desktop apps, with a visible plan, permissions and checks.",
+  "note": "Write to Kaoru in chat; it can reply with synthesized speech. The interface is available in English, Spanish and Japanese since v2.3.",
+  "caption": "Kaoru’s Live2D avatar. You can choose another model with the appropriate usage rights.",
+  "strip": [
+    "Conversation with context",
+    "Tasks with tools",
+    "Voice and local memory",
+    "Live2D presence"
+  ],
+  "requirementsTitle": "What your device needs",
+  "requirementsIntro": "Provisional minimums for using a remote AI provider. This starting point comes from one Linux x64 measurement and still needs validation on more devices and platforms.",
+  "requirementsHeaders": [
+    "Resource",
+    "Minimum",
+    "Recommended"
+  ],
+  "requirementsModes": [
+    {
+      "title": "Terminal agent and chat",
+      "description": "No windows, voice or avatar. Installed from source.",
+      "rows": [
+        [
+          "RAM",
+          "4 GB",
+          "8 GB"
+        ],
+        [
+          "CPU",
+          "2 cores",
+          "4 cores"
+        ],
+        [
+          "Free disk",
+          "2 GB",
+          "4 GB"
+        ]
+      ],
+      "gpu": "Dedicated GPU: not required with a remote provider."
+    },
+    {
+      "title": "Desktop with Live2D",
+      "description": "Chat, memory and avatar; voice optional.",
+      "rows": [
+        [
+          "RAM",
+          "8 GB",
+          "16 GB"
+        ],
+        [
+          "CPU",
+          "2 cores",
+          "4 cores"
+        ],
+        [
+          "Free disk",
+          "3 GB",
+          "5 GB"
+        ]
+      ],
+      "gpu": "Dedicated GPU: optional; graphics acceleration improves the avatar."
+    }
+  ],
+  "requirementsCaveat": "Voice, Chromium and local AI models may need more resources. A local model's GPU requirement depends on that model; no universal minimum has been measured yet.",
+  "requirementsDetail": "See measurements and limits behind these provisional figures (Spanish)",
+  "featuresTitle": "More than a coding agent",
+  "featuresIntro": "Talk with Kaoru, ask it to remember what matters or delegate a multi-step task. It can help across your project and desktop; available capabilities depend on your provider, operating system and permissions.",
+  "features": [
+    [
+      "01",
+      "Work in a repository",
+      "Explore files, dependencies and LSP symbols to inform a plan. Read and edit code, run commands and use Git. The structural index is bounded; references and file contents still need confirmation through project tools."
+    ],
+    [
+      "02",
+      "Check changes",
+      "In the smart workflow, a recognized mutation triggers configured verification. Compatible focused tests run before general checks; a skipped or failed result does not count as a passed test."
+    ],
+    [
+      "03",
+      "Resume an objective",
+      "Objectives, steps and evidence can persist in SQLite so work can continue. If storage falls back to memory, that continuity does not survive application shutdown."
+    ],
+    [
+      "04",
+      "Keep context in conversation",
+      "Local memory retrieves facts, preferences and episodes related to a conversation. You can ask Kaoru to forget memories. Retrieved context may be included in a request to your AI provider."
+    ],
+    [
+      "05",
+      "Use voice and an avatar",
+      "Edge TTS generates speech through a Microsoft service. Microphone input is not available in the current interface. The avatar supports configurable models and gestures."
+    ],
+    [
+      "06",
+      "Chain desktop tasks",
+      "Ask for several results, such as opening a report, creating a reminder and confirming both. Kaoru reviews the plan, asks for initial authorization and checks each result; missing evidence pauses the mission. Beta: tested with scripted scenarios, without external validation yet. Accessibility varies by app, and macOS lacks semantic parity."
+    ],
+    [
+      "07",
+      "Connect your tools",
+      "GitHub and local plugins expand available tasks. Review each tool's permissions and origin before using it."
+    ],
+    [
+      "08",
+      "Receive timely suggestions",
+      "Configured sensors provide system and project signals. Proactivity evaluates context and policies to suggest help; it does not grant the model additional execution permissions."
+    ],
+    [
+      "09",
+      "Choose where the model runs",
+      "Configure a compatible provider or a local endpoint. Quality, cost, vision and tool availability depend on the selected model and service."
+    ],
+    [
+      "10",
+      "Terminal and chat side by side",
+      "Open a chat beside a terminal in the same project. Review selected or recent output before choosing to send it to the model; Kaoru does not send it automatically. Single-line shell snippets can be pasted or run after confirmation."
+    ]
+  ],
+  "flowTitle": "From conversation to results",
+  "flowIntro": "Ask for guidance, continue a conversation or delegate several results in a desktop mission. Kaoru interprets the request with your chosen model and shows its plan and tool activity in chat; permission and verification are decided outside the model.",
+  "flow": [
+    [
+      "Inspect",
+      "Examine the workspace, find relevant paths and consult available symbols."
+    ],
+    [
+      "Plan",
+      "Break the objective into observable results and review whether any are missing."
+    ],
+    [
+      "Authorize",
+      "A desktop mission asks for initial authorization; out-of-scope actions require their own permission."
+    ],
+    [
+      "Execute",
+      "Use tools and retain their results as evidence of the work."
+    ],
+    [
+      "Verify",
+      "Check each result in the environment; missing evidence pauses the mission with a pending step."
+    ]
+  ],
+  "securityTitle": "Choose what Kaoru can access",
+  "securityIntro": "Configure permissions for your task and device. The application separates model proposals from the controls that authorize tools.",
+  "security": [
+    [
+      "Tool permissions",
+      "Allow, ask and deny rules automate specific operations, request confirmation or block them. Not every action displays a prompt: the active policy determines that."
+    ],
+    [
+      "Separate desktop capabilities",
+      "Applications, browser, screen, pointer, keyboard, processes and camera have independent controls. The current camera tool checks status or opens the camera application; it does not take photos or record video."
+    ],
+    [
+      "Isolation depends on the environment",
+      "Electron windows are isolated from direct Node access. Command isolation is a separate mechanism and depends on the system’s capabilities and configuration."
+    ],
+    [
+      "Checkpoints and recovery",
+      "Kaoru captures a baseline for recognized changes. Recovery has limits: remote actions, arbitrary commands and external effects may not be reversible."
+    ],
+    [
+      "External content",
+      "Web and integration results are treated as untrusted content in the flows that delimit them. These controls reduce the risk of malicious instructions; they do not guarantee immunity."
+    ],
+    [
+      "Data and credentials",
+      "Memory and embeddings are stored locally. Prompts may leave the device for your chosen provider. The system keychain is used when available; configuration backups require care."
+    ]
+  ],
+  "privacyLink": "See what stays on your device and what may leave it",
+  "audienceTitle": "Set up Kaoru for the way you work",
+  "audience": [
+    [
+      "Personal use",
+      "Start with conversation, one workspace and the permissions you need. Enable voice, memory or suggestions to suit your routine; you can change the Live2D model."
+    ],
+    [
+      "Development",
+      "Declare repository rules, prepare dependencies and configure verification commands. Review diffs and results before integrating important changes."
+    ],
+    [
+      "Teams and client projects",
+      "Define what information may reach the provider, who manages credentials and which tools are allowed. The code license does not cover characters or replace your organization’s policies."
+    ]
+  ],
+  "galleryTitle": "On your desktop",
+  "galleryIntro": "Actual project screenshots. Appearance varies with your model and configuration.",
+  "gallery": [
+    "Kaoru welcome screen",
+    "A suggestion from Kaoru"
+  ],
+  "quickTitle": "Start with a conversation. Delegate when you need to.",
+  "quickIntro": "Choose a provider and a project. You can begin with a question or request a small result you can check. The guide covers installation, permissions and platform limits.",
+  "quickSteps": [
+    "Install and open Kaoru.",
+    "Configure the provider and select a workspace.",
+    "Request a read-only analysis before allowing changes."
+  ],
+  "docs": "Technical reference",
+  "footer": "Kaoru · Source code under the MIT license",
+  "rights": "Third-party models and characters retain their own rights. Independent project, not affiliated with HoYoverse.",
+  "guideIntro": "Configuration, tasks and review criteria for using Kaoru on your device or in a client project. Since v2.3, the interface can follow your system language or use English, Spanish or Japanese.",
+  "manualLink": "Read the full product manual (Spanish)",
+  "guideSections": [
+    [
+      "install",
+      "Installation and first launch",
+      "Download Kaoru for your operating system. Clicking a button starts the download immediately, with no intermediate pages. Then open the installer and follow the first-launch guide."
+    ],
+    [
+      "provider",
+      "Provider, model and cost",
+      "Choose your provider and model in Kaoru’s settings. Use an authorized key or a compatible endpoint. Review your provider’s data policy, quotas and costs; open-source software does not include API usage. A local model does not automatically disconnect TTS, browsing or integrations."
+    ],
+    [
+      "workspace",
+      "Workspace and rules",
+      "Select the project folder from the chat toolbar. Prepare its dependencies and rules: Kaoru can incorporate AGENTS.md, CLAUDE.md or .cursorrules. Avoid including files unrelated to the task. Project rules guide the work; execution permissions are resolved separately."
+    ],
+    [
+      "terminal-chat",
+      "Terminal with a side chat",
+      "Create a terminal in your workspace and choose Chat to open a linked conversation without stopping the shell. Select output and use Ask Kaoru to attach it as a reviewable card before sending. Explain error prepares a draft. Single-line shell snippets from chat can be pasted without running or run after explicit confirmation. The shell uses your user permissions."
+    ],
+    [
+      "task",
+      "A useful first task",
+      "Try: “Analyze how this form is validated, identify the relevant files and propose tests; do not edit yet.” Then authorize a specific change with an observable result. Review the plan, activity and diff, and cancel generation when you need to stop the run."
+    ],
+    [
+      "verification",
+      "Tests and completion",
+      "Configure your project’s commands. In smart mode, verification after recognized mutations can run quality scripts and a fallback JavaScript syntax check. Automatic focused selection recognizes tests/run-all.sh; other runners need configuration. Impact searches are approximate and do not replace integration tests."
+    ],
+    [
+      "desktop",
+      "Voice, browser and operating system",
+      "For a task across apps, describe the results you want to observe: ‘open the report in the editor, create a reminder and confirm it appears’. Kaoru prepares and reviews a mission, asks for initial authorization and advances result by result; when accessibility cannot verify one, it reports the pending step. Neural speech is included and needs internet; microphone input is not available in the current interface. Opening a URL uses your default browser; page inspection uses managed Chromium. Linux uses AT-SPI2 and Windows uses UI Automation; macOS coverage is partial."
+    ],
+    [
+      "connections",
+      "Integrations and teamwork",
+      "Connect only authorized accounts. Choose the scopes you need in GitHub, and revoke access you no longer use. Review plugin origins and permissions. Start with a test repository before using client data, and agree on what context may leave the device."
+    ],
+    [
+      "recovery",
+      "Continuity and recovery",
+      "Memory and durable objectives require working local storage. Keep backups before important operations. A checkpoint does not automatically undo actions in external services. Read-only subagents can investigate in parallel; subagents that modify the workspace run serially."
+    ],
+    [
+      "delivery",
+      "Before a client handoff",
+      "Check functionality, diffs, tests and reported limitations. Document the provider, permissions and data handling for that installation. For commercial distribution, use an avatar you own or have appropriate rights to: March 7th assets are not covered by MIT. This website does not offer a contractual support commitment or SLA."
+    ]
+  ],
+  "installNote": "Run these commands in your development environment. Then consult the repository reference for initial configuration, voice and system-specific dependencies.",
+  "downloadTitle": "Download Kaoru",
+  "downloadIntro": "Pick your operating system. The download starts when you click (version {version}).",
+  "osWindows": "Windows",
+  "osLinux": "Linux",
+  "osMac": "macOS",
+  "dlWinSetup": "Installer",
+  "dlWinSetupHint": "Recommended · .exe",
+  "dlWinPortable": "Portable",
+  "dlWinPortableHint": "No install · .exe",
+  "dlLinuxDeb": ".deb",
+  "dlLinuxDebHint": "Debian, Ubuntu and derivatives",
+  "dlLinuxAppImage": "AppImage",
+  "dlLinuxAppImageHint": "Universal · make it executable",
+  "dlLinuxNote": "AppImage: right-click → Properties → allow executing as a program, or run chmod +x in the terminal.",
+  "dlMacIntel": "Intel",
+  "dlMacIntelHint": "DMG · Intel processors",
+  "dlMacArm": "Apple Silicon",
+  "dlMacArmHint": "DMG · M1, M2 and later",
+  "sourceTitle": "Install from source (developers)",
+  "release": "Browse published releases",
+  "installDocs": "Full installation instructions",
+  "requirementsLink": "Provisional RAM, CPU and disk requirements (Spanish)",
+  "copy": "Copy commands",
+  "copied": "Copied",
+  "copyError": "Select and copy the command block.",
+  "legalIntro": "Information about using Kaoru and its components.",
+  "updated": "Website review: September 14, 2026",
+  "contents": "On this page"
+}

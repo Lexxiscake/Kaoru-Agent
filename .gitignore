@@ -1,0 +1,60 @@
+# ── Dependencias y build ─────────────────────────────────────────────────────
+node_modules/
+dist/
+
+# ── Reportes de cobertura (c8) ────────────────────────────────────────────────
+.coverage/
+coverage/
+
+# ── Configuración sensible (nunca se sube) ───────────────────────────────────
+# La config real de cada máquina vive en %APPDATA% / ~/.config/vtuber-overlay/
+.env
+*.env
+config.json
+.march7th/
+
+# ── Bases de datos locales (memoria/sesiones del usuario) ────────────────────
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# ── Modelos de voz (se descargan automáticamente) ────────────────────────────
+models/vosk-es/
+
+# ── Modelos Live2D importados por el usuario ─────────────────────────────────
+# Los modelos que el usuario importa en `models/` no se suben al repo.
+# `March 7th` (modelo por defecto del proyecto) se sigue versionando.
+models/*
+!models/March 7th/
+!models/March 7th/**
+
+# ── Datos personales y exportaciones de conversación ─────────────────────────
+exports/
+test.txt
+# Feedback de runtime del usuario (no se versiona): proactivo, aprendizaje y
+# confianza (Fase 3 ítems 2/4) — los genera el core en headless/benchmark.
+data/proactive_feedback.json
+data/learning_feedback.json
+data/trust_feedback.json
+
+# ── Artefactos de desarrollo y parches one-off ───────────────────────────────
+*.patch
+*.orig
+*.rej
+tests/prueba_vivo_*.js
+tests/e2e/artifacts/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Sistema operativo / editores ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporales locales
+*.tmp
+.kaoru-appcontainer-*.tmp

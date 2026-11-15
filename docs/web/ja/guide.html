@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="自分の端末や顧客のプロジェクトでKaoruを使うための設定、作業例、確認事項。v2.3から、システムの言語に追従するか、英語・スペイン語・日本語を選べます。"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f8f8f7" />
+    <title>使い方 — Kaoru</title>
+    <link rel="alternate" hreflang="es" href="../guide.html" />
+    <link rel="alternate" hreflang="en" href="../en/guide.html" />
+    <link rel="alternate" hreflang="ja" href="../ja/guide.html" />
+    <link rel="alternate" hreflang="x-default" href="../guide.html" />
+    <link rel="stylesheet" href="../assets/styles.css" />
+    <script src="../assets/main.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">本文へ移動</a>
+    <header class="nav">
+      <div class="nav-inner">
+        <a class="nav-logo" href="index.html" aria-label="Kaoru"
+          ><span class="logo-mark" aria-hidden="true">k.</span>Kaoru</a
+        >
+        <nav class="nav-links" id="site-navigation" aria-label="ホーム">
+          <a href="index.html#features">Kaoruでできること</a
+          ><a href="index.html#workflow">作業の流れ</a><a href="index.html#security">セキュリティ</a
+          ><a href="index.html#requirements">動作要件</a
+          ><a href="guide.html" aria-current="page">使い方</a>
+        </nav>
+        <div class="nav-actions">
+          <button
+            class="theme-btn"
+            id="theme-toggle"
+            type="button"
+            aria-label="テーマを切り替える"
+            aria-pressed="false"
+          >
+            <span aria-hidden="true">◐</span></button
+          ><button
+            class="theme-btn menu-toggle"
+            type="button"
+            aria-label="ナビゲーションを開く"
+            aria-controls="site-navigation"
+            aria-expanded="false"
+          >
+            <span aria-hidden="true">☰</span></button
+          ><a class="btn-dark nav-github" href="https://github.com/Dregxmoon/Kaoru-Agent"
+            >GitHub <span aria-hidden="true">↗</span></a
+          >
+        </div>
+      </div>
+      <nav class="language-bar" aria-label="言語">
+        <a href="../guide.html" lang="es" hreflang="es">Español</a
+        ><a href="../en/guide.html" lang="en" hreflang="en">English</a
+        ><a href="../ja/guide.html" lang="ja" hreflang="ja" aria-current="page">日本語</a>
+      </nav>
+    </header>
+    <main id="main">
+      <header class="page-heading container">
+        <span class="eyebrow">KAORU / 使い方</span>
+        <h1>使い方</h1>
+        <p>
+          自分の端末や顧客のプロジェクトでKaoruを使うための設定、作業例、確認事項。v2.3から、システムの言語に追従するか、英語・スペイン語・日本語を選べます。
+        </p>
+        <p><a href="../manual.html">製品マニュアルを読む（スペイン語） →</a></p>
+      </header>
+      <div class="container document-layout">
+        <aside class="toc">
+          <nav aria-label="このページの内容">
+            <strong>このページの内容</strong><a href="#install">インストールと初回起動</a
+            ><a href="#provider">プロバイダー、モデル、費用</a
+            ><a href="#workspace">ワークスペースとルール</a
+            ><a href="#terminal-chat">ターミナルとサイドチャット</a
+            ><a href="#task">最初の依頼の例</a><a href="#verification">テストと完了の確認</a
+            ><a href="#desktop">音声、ブラウザー、OS</a
+            ><a href="#connections">連携とチームでの利用</a><a href="#recovery">作業の継続と復旧</a
+            ><a href="#delivery">顧客へ引き渡す前に</a>
+          </nav>
+        </aside>
+        <article class="prose">
+          <section id="install">
+            <h2>1. インストールと初回起動</h2>
+            <p>
+              お使いのOS向けにKaoruをダウンロードします。ボタンを押すと他のページを経由せずにダウンロードが始まります。その後インストーラーを開き、初回起動ガイドに進んでください。
+            </p>
+            <h3>Kaoruをダウンロード</h3>
+            <p>OSを選んでください。クリックでダウンロードが始まります（バージョン2.3.1）。</p>
+            <div class="dl-grid">
+              <article class="dl-card fade-up">
+                <span class="dl-icon"
+                  ><svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M3 5.5 10.5 4.4v7.1H3zM11.6 4.2 21 3v8.5h-9.4zM3 12.5h7.5v7.1L3 18.5zM11.6 12.5H21V21l-9.4-1.2z"
+                    /></svg
+                ></span>
+                <h4>Windows</h4>
+                <div class="dl-actions">
+                  <a
+                    class="dl-btn"
+                    href="https://github.com/Dregxmoon/Kaoru-Agent/releases/download/v2.3.1/Asistente.Personal.Setup.2.3.1.exe"
+                    download
+                    ><span class="dl-file">インストーラー</span
+                    ><span class="dl-hint">推奨 · .exe</span></a
+                  ><a
+                    class="dl-btn"
+                    href="https://github.com/Dregxmoon/Kaoru-Agent/releases/download/v2.3.1/Asistente.Personal.2.3.1.exe"
+                    download
+                    ><span class="dl-file">ポータブル版</span
+                    ><span class="dl-hint">インストール不要 · .exe</span></a
+                  >
+                </div>
+              </article>
+              <article class="dl-card fade-up">
+                <span class="dl-icon"
+                  ><svg viewBox="0 0 24 24" aria-hidden="true">
+                    <ellipse cx="12" cy="13.5" rx="6.5" ry="8" fill="currentColor" />
+                    <ellipse cx="12" cy="15.5" rx="3.8" ry="4.6" fill="#fff" opacity=".92" />
+                    <circle cx="10" cy="8.6" r="1.1" fill="#fff" />
+                    <circle cx="14" cy="8.6" r="1.1" fill="#fff" />
+                    <circle cx="10" cy="8.6" r=".45" fill="#222" />
+                    <circle cx="14" cy="8.6" r=".45" fill="#222" />
+                    <path d="M12 10.4l-1.6 1.8 1.6 1.8 1.6-1.8z" fill="#e8a33d" />
+                    <ellipse cx="8.3" cy="21" rx="2" ry="1" fill="#e8a33d" />
+                    <ellipse cx="15.7" cy="21" rx="2" ry="1" fill="#e8a33d" /></svg
+                ></span>
+                <h4>Linux</h4>
+                <div class="dl-actions">
+                  <a
+                    class="dl-btn"
+                    href="https://github.com/Dregxmoon/Kaoru-Agent/releases/download/v2.3.1/asistente-personal_2.3.1_amd64.deb"
+                    download
+                    ><span class="dl-file">.deb</span
+                    ><span class="dl-hint">Debian、Ubuntuとその派生版</span></a
+                  ><a
+                    class="dl-btn"
+                    href="https://github.com/Dregxmoon/Kaoru-Agent/releases/download/v2.3.1/Asistente.Personal-2.3.1.AppImage"
+                    download
+                    ><span class="dl-file">AppImage</span
+                    ><span class="dl-hint">汎用 · 実行権限を付与</span></a
+                  >
+                </div>
+                <p class="dl-note">
+                  AppImage：右クリック→プロパティ→プログラムとして実行を許可、またはターミナルでchmod
+                  +xを実行。
+                </p>
+              </article>
+              <article class="dl-card fade-up">
+                <span class="dl-icon"
+                  ><svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M16.7 12.9c0-2.4 2-3.6 2.1-3.7-1.1-1.7-2.9-1.9-3.5-1.9-1.5-.2-2.9.9-3.7.9-.8 0-1.9-.9-3.2-.9-1.6 0-3.1 1-4 2.4-1.7 2.9-.4 7.3 1.2 9.7.6.9 1.3 1.9 2.3 1.8 1-.4 1.3-1.2 2.5-1.2s1.5.8 2.5.8c1 0 1.7-.9 2.3-1.8.7-1.1 1-2.1 1-2.2-.1 0-2-1.1-2.1-2.9zM14.2 5.4c.7-.8 1.1-1.9 1-3-1 0-2.1.6-2.8 1.4-.6.7-1.2 1.9-1 3 1.1.1 2.1-.6 2.8-1.4z"
+                    /></svg
+                ></span>
+                <h4>macOS</h4>
+                <div class="dl-actions">
+                  <a
+                    class="dl-btn"
+                    href="https://github.com/Dregxmoon/Kaoru-Agent/releases/download/v2.3.1/Asistente.Personal-2.3.1.dmg"
+                    download
+                    ><span class="dl-file">Intel</span
+                    ><span class="dl-hint">DMG · Intelプロセッサ</span></a
+                  ><a
+                    class="dl-btn"
+                    href="https://github.com/Dregxmoon/Kaoru-Agent/releases/download/v2.3.1/Asistente.Personal-2.3.1-arm64.dmg"
+                    download
+                    ><span class="dl-file">Apple Silicon</span
+                    ><span class="dl-hint">DMG · M1、M2以降</span></a
+                  >
+                </div>
+              </article>
+            </div>
+            <details class="source-install">
+              <summary>ソースからインストール（開発者向け）</summary>
+              <div class="code-block">
+                <div class="code-heading">
+                  <span>Git / npm</span
+                  ><button
+                    type="button"
+                    class="copy-button"
+                    data-copy="install-commands"
+                    data-copied="コピーしました"
+                    data-error="コマンドのブロックを選択してコピーしてください。"
+                  >
+                    コマンドをコピー
+                  </button>
+                </div>
+                <pre><code id="install-commands">git clone https://github.com/Dregxmoon/Kaoru-Agent.git
+cd Kaoru-Agent
+npm install
+npm run rebuild
+npx electron .</code></pre>
+              </div>
+              <p class="copy-status" role="status" aria-live="polite"></p>
+              <p>
+                開発環境で次のコマンドを実行してください。初期設定、音声、OS固有の依存関係は、リポジトリのリファレンスを参照してください。
+              </p>
+            </details>
+            <p class="inline-links">
+              <a href="https://github.com/Dregxmoon/Kaoru-Agent/blob/produccion/README.md"
+                >詳しいインストール手順 ↗</a
+              ><a href="https://github.com/Dregxmoon/Kaoru-Agent/blob/produccion/docs/requisitos.md"
+                >RAM・CPU・ディスクの暫定要件（スペイン語） ↗</a
+              >
+            </p>
+          </section>
+          <section id="provider">
+            <h2>2. プロバイダー、モデル、費用</h2>
+            <p>
+              Kaoruの設定でプロバイダーとモデルを選び、利用権限のあるキーまたは互換エンドポイントを設定します。プロバイダーのデータポリシー、上限、料金を確認してください。オープンソースのソフトウェアにAPIの利用料は含まれません。ローカルモデルを使っても、TTS、ブラウジング、連携が自動でオフラインになるわけではありません。
+            </p>
+          </section>
+          <section id="workspace">
+            <h2>3. ワークスペースとルール</h2>
+            <p>
+              チャットのツールバーからプロジェクトのフォルダーを選び、依存関係とルールを準備します。AGENTS.md、CLAUDE.md、.cursorrulesを取り込めます。作業と無関係なファイルは含めないでください。プロジェクトルールは作業の指針となり、実行権限は別に判定されます。
+            </p>
+          </section>
+          <section id="terminal-chat">
+            <h2>4. ターミナルとサイドチャット</h2>
+            <p>
+              ワークスペースでターミナルを作成し、Chatからシェルを止めずに連携チャットを開けます。出力を選択してKaoruに質問すると、送信前に確認できるカードとして添付されます。エラーの説明は下書きを作ります。チャット内の1行コマンドは実行せずに貼り付けるか、明示的な確認後に実行できます。シェルは利用者の権限で動きます。
+            </p>
+          </section>
+          <section id="task">
+            <h2>5. 最初の依頼の例</h2>
+            <p>
+              「このフォームの入力検証を調べ、関連ファイルと必要なテストを示してください。まだ編集しないでください」と依頼してみてください。その後、結果を確認できる具体的な変更を許可します。計画、操作履歴、差分を確認し、作業を止めたいときは生成をキャンセルしてください。
+            </p>
+          </section>
+          <section id="verification">
+            <h2>6. テストと完了の確認</h2>
+            <p>
+              プロジェクトの検証コマンドを設定します。smartモードでは、認識された変更後に品質チェック用スクリプトや、補助的なJavaScript構文チェックを実行できます。関連テストの自動選択はtests/run-all.shに対応し、それ以外は設定が必要です。影響範囲の推定は近似であり、結合テストの代わりにはなりません。
+            </p>
+          </section>
+          <section id="desktop">
+            <h2>7. 音声、ブラウザー、OS</h2>
+            <p>
+              複数のアプリを使う場合は、確認したい結果を伝えてください。例：「エディターでレポートを開き、リマインダーを作り、表示されたことを確認して」。Kaoruは計画を見直し、最初に許可を求め、結果ごとに進みます。アクセシビリティで確認できない結果は未完了として知らせます。ニューラル音声は同梱されておりインターネット接続が必要です。現在の画面ではマイク入力は利用できません。URLを開く際は既定のブラウザーを、ページの検査には管理対象Chromiumを使います。LinuxはAT-SPI2、WindowsはUI
+              Automationに対応し、macOSは一部対応です。
+            </p>
+          </section>
+          <section id="connections">
+            <h2>8. 連携とチームでの利用</h2>
+            <p>
+              権限のあるアカウントだけを接続してください。GitHubでは必要なスコープを選び、不要なアクセスを取り消します。プラグインの配布元や権限を確認してください。顧客データを使う前にテスト用リポジトリで試し、端末外に送れる文脈の範囲を合意してください。
+            </p>
+          </section>
+          <section id="recovery">
+            <h2>9. 作業の継続と復旧</h2>
+            <p>
+              記憶と永続的な目標には、正常に動作するローカルストレージが必要です。重要な操作の前にバックアップを用意してください。チェックポイントは外部サービスの操作を自動で取り消しません。読み取り専用のサブエージェントは並列に調査できますが、ワークスペースを変更する処理は直列で実行します。
+            </p>
+          </section>
+          <section id="delivery">
+            <h2>10. 顧客へ引き渡す前に</h2>
+            <p>
+              機能、差分、テスト、報告された制限を確認します。その環境のプロバイダー、権限、データの扱いを記録してください。商用で配布する場合は自作または適切な利用権限のあるアバターを使用します。三月なのかのアセットはMITの対象外です。このサイトは契約上のサポートやSLAを提供するものではありません。
+            </p>
+          </section>
+          <p class="note">
+            <a href="privacy.html">プライバシー</a> · <a href="terms.html">利用規約とライセンス</a>
+          </p>
+        </article>
+      </div>
+    </main>
+    <footer>
+      <div class="container footer-top">
+        <a class="nav-logo" href="index.html"
+          ><span class="logo-mark" aria-hidden="true">k.</span>Kaoru</a
+        >
+        <nav aria-label="利用規約とライセンス">
+          <a href="index.html">ホーム</a><a href="guide.html" aria-current="page">使い方</a
+          ><a href="privacy.html">プライバシー</a><a href="terms.html">利用規約とライセンス</a
+          ><a href="mailto:dregxmoon@gmail.com">dregxmoon@gmail.com</a>
+        </nav>
+      </div>
+      <div class="container footer-bottom">
+        <p>Kaoru · ソースコードはMITライセンス</p>
+        <p>
+          第三者のモデルとキャラクターには、それぞれの権利が適用されます。HoYoverseとは提携していない独立したプロジェクトです。
+        </p>
+      </div>
+    </footer>
+  </body>
+</html>

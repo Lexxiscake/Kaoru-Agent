@@ -1,0 +1,913 @@
+// @ts-nocheck
+/**
+ * StructuredActionParser.js — Fase 3
+ *
+ * Reemplaza el ActionParser basado en regex de Planner.js para el flujo
+ * donde el LLM fue instruido con toolIntent (nivel high o medium).
+ *
+ * Cuando el GroqSerializer inyectó una instrucción de formato en el
+ * system prompt, el LLM responde con un bloque así:
+ *
+ *   ```action
+ *   ACCIÓN: edit_file | ARCHIVO: src/main.js
+ *   ```
+ *
+ * Este parser extrae ese bloque de forma determinista sin regex frágil
+ * sobre narrativa libre — solo busca el bloque delimitado.
+ *
+ * Si no encuentra bloque estructurado (el LLM ignoró la instrucción,
+ * o el nivel era 'none'), delega en el ActionParser original de Planner.js
+ * como fallback — compatibilidad hacia atrás total.
+ *
+ * Campos que puede devolver el bloque:
+ *   ACCIÓN        — nombre de la intención (siempre presente)
+ *   ARCHIVO       — path de archivo (para create/edit/read/delete_file)
+ *   RUTA          — directorio (para list_directory, create_directory)
+ *   COMANDO       — comando shell (para run_command, git_action, etc.)
+ *   QUERY         — búsqueda web (para web_search)
+ *   URL           — URL (para navigate_browser)
+
+ * Contrato de salida (mismo que ActionParser original):
+ * [
+ *   {
+ *     tool:        string,   — herramienta de OpenClaw
+ *     params:      object,   — parámetros para OpenClawBridge.execute()
+ *     description: string,   — descripción legible para el usuario
+ *     source:      'structured' | 'legacy_regex'
+ *   }
+ * ]
+ */
+
+'use strict';
+const logger = require('../observability/Logger.js');
+
+// V-05: Prototype pollution prevention — strip dangerous keys from LLM output
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+function _sanitizeLLMObject(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const clean = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (!DANGEROUS_KEYS.has(k)) clean[k] = v;
+  }
+  return clean;
+}
+
+// ── Mapa action → tool de OpenClaw ────────────────────────────────────────────
+// Mismo mapping que en el catálogo de init_vectors.js para consistencia.
+const ACTION_TO_TOOL = {
+  // FIX: 'create_file' iba mapeado a tool 'write', pero Planner._executeStep
+  // solo dispara el flujo especial (llm → write → verify, ver
+  // _executeCreateFile) cuando tool === 'create_file' exactamente. Con
+  // 'write' se habría llamado a OpenClawBridge.execute('write', {path,
+  // instruction}) directo — y el schema de 'write' espera {path, content},
+  // no {path, instruction}, así que 'content' habría llegado undefined.
+  create_file: 'create_file',
+  edit_file: 'edit_file', // manejado especialmente en Planner._executeEditFile
+  write: 'create_file', // alias moderno (el LLM en fallback textual usa write/edit)
+  edit: 'edit_file',
+  read: 'read',
+  read_file: 'read',
+  delete_file: 'exec', // mock: delete via exec del
+  create_directory: 'exec', // mkdir
+  list_directory: 'exec', // ls / dir
+  run_command: 'exec',
+  run_script: 'exec',
+  git_action: 'exec',
+  install_package: 'exec',
+  exec: 'exec', // alias directo (algunos modelos usan "exec")
+  web_search: 'web_search',
+  websearch: 'websearch',
+  webfetch: 'webfetch',
+  fetch_web: 'webfetch',
+  list_apps: 'list_apps',
+  launch_app: 'launch_app',
+  open_website: 'open_website',
+  play_media: 'play_media',
+  desktop_snapshot: 'desktop_snapshot',
+  desktop_screenshot: 'desktop_screenshot',
+  pointer_click: 'pointer_click',
+  window_list: 'window_list',
+  window_focus: 'window_focus',
+  ui_get_state: 'ui_get_state',
+  ui_wait: 'ui_wait',
+  ui_click: 'ui_click',
+  ui_type: 'ui_type',
+  ui_press: 'ui_press',
+  ui_select: 'ui_select',
+  ui_scroll: 'ui_scroll',
+  desktop_mission: 'desktop_mission',
+  window_close: 'window_close',
+  desktop_capabilities: 'desktop_capabilities',
+  process_list: 'process_list',
+  process_stop: 'process_stop',
+  camera_status: 'camera_status',
+  open_camera: 'open_camera',
+  navigate_browser: 'browser',
+  browser_action: 'browser',
+  apply_patch: 'apply_patch',
+  run_code: 'code_execution',
+  // Subagentes: perfil opcional (general por defecto). Ahora el fallback
+  // textual puede delegar sub-tareas igual que el tool-calling nativo.
+  subagent: 'subagent',
+
+  // Plugins — pseudo-tool manejado en Planner._executePlugin (ver ahí).
+  plugin_call: 'plugin',
+};
+
+// ── Descripción legible por acción ────────────────────────────────────────────
+function _buildDescription(action, fields) {
+  const f = fields;
+  switch (action) {
+    case 'create_file':
+      return `Crear archivo: ${f.ARCHIVO || '(sin nombre)'}`;
+    case 'edit_file':
+      return `Editar archivo: ${f.ARCHIVO || '(sin nombre)'}`;
+    case 'read_file':
+      return `Leer archivo: ${f.ARCHIVO || '(sin nombre)'}`;
+    case 'delete_file':
+      return `Eliminar archivo: ${f.ARCHIVO || '(sin nombre)'}`;
+    case 'create_directory':
+      return `Crear directorio: ${f.RUTA || '(sin nombre)'}`;
+    case 'list_directory':
+      return `Listar directorio: ${f.RUTA || '.'}`;
+    case 'run_command':
+      return `Ejecutar: ${f.COMANDO || '(sin comando)'}`;
+    case 'run_script':
+      return `Ejecutar script: ${f.COMANDO || '(sin comando)'}`;
+    case 'git_action':
+      return `Git: ${f.COMANDO || '(sin comando)'}`;
+    case 'install_package':
+      return `Instalar paquete: ${f.COMANDO || '(sin comando)'}`;
+    case 'web_search':
+      return `Buscar en la web: "${f.QUERY || ''}"`;
+    case 'websearch':
+      return `Buscar en la web (ligero): "${f.QUERY || ''}"`;
+    case 'webfetch':
+      return `Leer URL: ${f.URL || '(sin URL)'}`;
+    case 'list_apps':
+      return `Listar aplicaciones${f.QUERY ? `: ${f.QUERY}` : ''}`;
+    case 'launch_app':
+      return `Abrir aplicación: ${f.APLICACIÓN || f.APLICACION || f.APP || f.APPLICATION || f.NOMBRE || f.NAME || '?'}`;
+    case 'open_website':
+      return `Abrir sitio: ${f.SITIO || f.TARGET || f.URL || '?'}`;
+    case 'play_media':
+      return `Reproducir en ${f.SERVICIO || 'YouTube'}: ${f.QUERY || '?'}`;
+    case 'desktop_snapshot':
+      return `Observar escritorio: ${f.APLICACIÓN || f.APLICACION || f.APP || f.APPLICATION || 'todas las ventanas'}`;
+    case 'desktop_screenshot':
+      return `Capturar escritorio: ${f.VENTANA || f.NOMBRE || 'pantalla principal'}`;
+    case 'pointer_click':
+      return `Clic visual: ${f.X || '?'} x ${f.Y || '?'}`;
+    case 'window_list':
+      return `Listar ventanas: ${f.APLICACIÓN || f.APLICACION || f.APP || 'todas'}`;
+    case 'window_focus':
+    case 'ui_get_state':
+    case 'ui_click':
+    case 'ui_type':
+    case 'ui_press':
+    case 'ui_select':
+    case 'ui_scroll':
+    case 'window_close':
+      return `${action}: ${f.REF || '(sin referencia)'}`;
+    case 'ui_wait':
+      return `Esperar condición UI: ${f.NOMBRE || f.NAME || f.ESTADO || f.STATE || '?'}`;
+    case 'desktop_mission':
+      return `Misión de escritorio: ${f.META || f.GOAL || '(meta estructurada)'}`;
+    case 'desktop_capabilities':
+      return 'Consultar capacidades de escritorio';
+    case 'process_list':
+      return `Listar procesos${f.QUERY ? `: ${f.QUERY}` : ''}`;
+    case 'process_stop':
+      return `Terminar proceso PID ${f.PID || '?'}`;
+    case 'camera_status':
+      return 'Consultar estado de cámara';
+    case 'open_camera':
+      return 'Abrir aplicación de cámara';
+    case 'navigate_browser':
+      return `Navegar a: ${f.URL || '(sin URL)'}`;
+    case 'browser_action':
+      return `Navegador: ${f.ACCION || f.ACTION || f.URL || '(sin acción)'}`;
+    case 'apply_patch':
+      return `Aplicar patch a: ${f.ARCHIVO || '(sin archivo)'}`;
+    case 'run_code':
+      return `Ejecutar código: ${(f.CÓDIGO || f.CODIGO || f.CODE || '').slice(0, 60)}`;
+    case 'subagent':
+      return `Subagente (${f.AGENT || 'general'}): ${f.TAREA || f.TASK || '(sin tarea)'}`;
+    case 'plugin_call':
+      return `Plugin · ${f.HERRAMIENTA || f.TOOL || f.NOMBRE || '?'}`;
+    default:
+      return action;
+  }
+}
+
+// ── Sanitización antes de interpolar en un comando de shell ──────────────────
+// ARCHIVO/RUTA vienen del LLM, que a su vez puede haber sido influenciado por
+// contenido externo no confiable (p.ej. una página web leída con browser/
+// web_search — inyección de prompt indirecta). Antes de meterlos en un string
+// de shell como `del "${valor}"`, hay que asegurarse de que no puedan romper
+// el escapado e inyectar un comando extra. Esto es defensa en profundidad
+// ADEMÁS del diálogo de aprobación — si por lo que sea ese diálogo se salta,
+// esto igual frena la inyección.
+const SHELL_METACHAR_RE = /["'`$;&|<>\n\r]/;
+
+/**
+ * Bandera booleana desde bloque estructurado: true/1/sí/si → true;
+ * ausente o cualquier otro valor → undefined (no false: ausente significa
+ * "el modelo no lo pidió", y el bridge decide el default).
+ * @param {unknown} value
+ */
+function _parseBooleanFlag(value) {
+  if (value === undefined || value === null) return undefined;
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'sí', 'si', 'yes'].includes(normalized)) return true;
+  return undefined;
+}
+
+function _sanitizeShellArg(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (SHELL_METACHAR_RE.test(trimmed)) {
+    logger.warn(
+      'StructuredActionParser',
+      '[structured-parser] valor rechazado por caracteres de shell sospechosos:',
+      JSON.stringify(trimmed)
+    );
+    return null;
+  }
+  return trimmed;
+}
+
+// ── Extracción de JSON balanceado para el campo PARAMS ────────────────────────
+// PARAMS trae JSON, que casi siempre tiene ':' y a
+// veces '{...}' anidado. El split genérico de campos de abajo parte por
+// "|" y toma el primer ':' de cada línea — funciona para un JSON plano de
+// una sola línea, pero un regex simple para encontrar el cierre del
+// objeto se rompe con JSON anidado (se para en el primer '}', que puede
+// ser el de un objeto interno). Por eso esto cuenta llaves de verdad,
+// respetando strings, en vez de usar regex para el cierre.
+function _extractBalancedJSON(content, label) {
+  const labelRe = new RegExp(label + '\\s*:\\s*', 'i');
+  const m = content.match(labelRe);
+  if (!m) return null;
+
+  const searchFrom = m.index + m[0].length;
+  const braceStart = content.indexOf('{', searchFrom);
+  // El '{' debe venir casi inmediatamente después del label — si hay texto
+  // largo en medio, no es el JSON de este campo.
+  if (braceStart === -1 || braceStart - searchFrom > 10) return null;
+
+  let depth = 0,
+    inString = false,
+    escaped = false;
+  for (let i = braceStart; i < content.length; i++) {
+    const c = content[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      continue;
+    }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        return {
+          json: content.slice(braceStart, i + 1),
+          fullMatchStart: m.index,
+          fullMatchEnd: i + 1,
+        };
+      }
+    }
+  }
+  return null; // JSON sin cerrar — se ignora, no se intenta adivinar
+}
+
+/**
+ * Extrae el span crudo de un campo de bloque estructurado (CONTENIDO, COMANDO),
+ * SIN normalizar pipes (mismo patrón que _extractBalancedJSON con PARAMS). El
+ * valor empieza tras "<CAMPO>:" y termina en la siguiente línea que parezca
+ * otro campo "CLAVE: valor" o en el final del bloque. Extraerlo sobre el texto
+ * original ANTES del replace de "|" → salto de línea evita corromper pipes
+ * literales del valor (operador || de JS, alternancia de regex, tablas
+ * markdown).
+ *
+ * @param {string} content
+ * @param {string} fieldName
+ * @param {boolean} [allowInline]
+ *   true: acepta el ancla compacta "| CAMPO:" (formato de una línea); false:
+ *   solo acepta el ancla al inicio de línea (formato multilínea). El formato
+ *   compacto de una línea no puede usar span — el valor termina en el mismo
+ *   "|" que separa los campos siguientes y debe pasar por el parser genérico.
+ * @returns {{ value: string, start: number, end: number }|null}
+ *   null si no hay el campo. `[start,end)` es el span completo (desde el
+ *   inicio de la línea "<CAMPO>:" hasta el campo siguiente o el final).
+ */
+function _extractFieldSpan(content, fieldName, allowInline = true) {
+  const re = new RegExp('(^|\\n|\\|)[ \\t]*' + fieldName + ':[ \\t]*', 'i');
+  const m = content.match(re);
+  if (!m) return null;
+  if (!allowInline && m[1] === '|') return null;
+  const valueStart = m.index + m[0].length;
+  const rest = content.slice(valueStart);
+  const nextField = rest.match(/(^|\n)[ \t]*[A-ZÀ-ÚÑ_][A-ZÀ-ÚÑ_0-9]{1,}:[ \t]/);
+  const valueEnd = nextField ? valueStart + nextField.index : content.length;
+  return {
+    value: content.slice(valueStart, valueEnd).trim(),
+    start: m.index,
+    end: valueEnd,
+  };
+}
+
+// ── Construcción de params para OpenClawBridge ────────────────────────────────
+function _buildParams(action, fields, userGoal, projectCwd) {
+  const cwd = projectCwd || process.cwd();
+
+  // Alias modernos (fallback textual del LLM usa write/edit/read)
+  const MODERN_ALIASES = { write: 'create_file', edit: 'edit_file', read: 'read_file' };
+  action = MODERN_ALIASES[action] || action;
+
+  switch (action) {
+    case 'desktop_mission': {
+      if (!fields.PARAMS) return null;
+      try {
+        const params = JSON.parse(fields.PARAMS);
+        return params && typeof params === 'object' && !Array.isArray(params) ? params : null;
+      } catch (_) {
+        return null;
+      }
+    }
+    case 'create_file':
+      return {
+        path: fields.ARCHIVO,
+        // G.1: el LLM puede incluir el contenido en CONTENIDO: — si viene,
+        // se usa como instruction (en vez de repetir el userGoal como texto).
+        instruction: fields.CONTENIDO || userGoal || `Crear el archivo ${fields.ARCHIVO}`,
+      };
+
+    case 'edit_file':
+      return {
+        path: fields.ARCHIVO,
+        instruction: fields.CONTENIDO || userGoal || `Editar el archivo ${fields.ARCHIVO}`,
+      };
+
+    case 'read_file':
+      return { path: fields.ARCHIVO };
+
+    case 'plugin_call': {
+      const toolId = fields.HERRAMIENTA || fields.TOOL || fields.NOMBRE;
+      if (!toolId) {
+        logger.warn(
+          'StructuredActionParser',
+          '[structured-parser] plugin_call sin HERRAMIENTA/TOOL:',
+          fields
+        );
+        return null;
+      }
+      let pluginArgs = {};
+      if (fields.PARAMS) {
+        try {
+          pluginArgs = JSON.parse(fields.PARAMS);
+        } catch (e) {
+          logger.warn(
+            'StructuredActionParser',
+            '[structured-parser] PARAMS de plugin_call no es JSON válido, se ignora:',
+            fields.PARAMS
+          );
+          return null;
+        }
+      }
+      return { name: toolId, args: pluginArgs };
+    }
+
+    case 'delete_file': {
+      const safeArchivo = _sanitizeShellArg(fields.ARCHIVO);
+      if (!safeArchivo) return null;
+      return {
+        command: process.platform === 'win32' ? `del "${safeArchivo}"` : `rm "${safeArchivo}"`,
+        cwd,
+      };
+    }
+
+    case 'create_directory': {
+      const safeRuta = _sanitizeShellArg(fields.RUTA || fields.ARCHIVO || 'nueva-carpeta');
+      if (!safeRuta) return null;
+      return {
+        command: `mkdir "${safeRuta}"`,
+        cwd,
+      };
+    }
+
+    case 'list_directory': {
+      const safeDir = _sanitizeShellArg(fields.RUTA || fields.ARCHIVO || '.');
+      if (!safeDir) return null;
+      return {
+        command: process.platform === 'win32' ? `dir "${safeDir}"` : `ls -la "${safeDir}"`,
+        cwd,
+      };
+    }
+
+    case 'run_command':
+    case 'run_script':
+    case 'git_action':
+    case 'install_package':
+    case 'exec':
+      return {
+        command: fields.COMANDO,
+        cwd,
+      };
+
+    case 'web_search':
+      return { query: fields.QUERY, max_results: 5 };
+
+    case 'websearch':
+      return { query: fields.QUERY, max_results: 5 };
+
+    case 'webfetch':
+      return { url: fields.URL };
+
+    case 'list_apps':
+      return { query: fields.QUERY || fields.APLICACIÓN || fields.APLICACION || '' };
+
+    case 'launch_app':
+      return {
+        app:
+          fields.APLICACIÓN ||
+          fields.APLICACION ||
+          fields.APP ||
+          fields.APPLICATION ||
+          fields.NOMBRE ||
+          fields.NAME,
+      };
+
+    case 'open_website':
+      return {
+        target: fields.SITIO || fields.TARGET || fields.URL,
+        browser: fields.NAVEGADOR || fields.BROWSER,
+        control: fields.CONTROL || 'external',
+        needsVerification: _parseBooleanFlag(fields.VERIFY || fields.VERIFICAR || fields.NEEDS),
+      };
+
+    case 'play_media':
+      return {
+        query: fields.QUERY,
+        service: fields.SERVICIO || fields.SERVICE || 'youtube',
+        control: fields.CONTROL || 'managed',
+        browser: fields.NAVEGADOR || fields.BROWSER,
+      };
+
+    case 'desktop_snapshot':
+    case 'window_list':
+      return {
+        application:
+          fields.APLICACIÓN ||
+          fields.APLICACION ||
+          fields.APP ||
+          fields.APPLICATION ||
+          fields.VENTANA ||
+          fields.WINDOW,
+        maxDepth: fields.PROFUNDIDAD ? Number(fields.PROFUNDIDAD) : undefined,
+        maxNodes: fields.LIMITE ? Number(fields.LIMITE) : undefined,
+      };
+
+    case 'desktop_screenshot':
+      return {
+        sourceId: fields.SOURCE_ID,
+        sourceName: fields.VENTANA || fields.WINDOW || fields.NOMBRE || fields.NAME,
+        width: fields.ANCHO ? Number(fields.ANCHO) : undefined,
+        height: fields.ALTO ? Number(fields.ALTO) : undefined,
+      };
+
+    case 'pointer_click':
+      return {
+        captureId: fields.CAPTURA || fields.CAPTURE_ID,
+        x: Number(fields.X),
+        y: Number(fields.Y),
+      };
+
+    case 'window_focus':
+    case 'ui_get_state':
+    case 'ui_click':
+    case 'ui_type':
+    case 'ui_press':
+    case 'ui_select':
+    case 'ui_scroll':
+    case 'window_close':
+      return {
+        observationId: fields.OBSERVACION || fields.OBSERVATION_ID,
+        ref: fields.REF,
+        value: fields.VALOR || fields.VALUE,
+        key: fields.TECLA || fields.KEY,
+        direction: fields.DIRECCION || fields.DIRECCIÓN || fields.DIRECTION,
+        amount: fields.CANTIDAD ? Number(fields.CANTIDAD) : undefined,
+      };
+
+    case 'ui_wait':
+      return {
+        application: fields.APLICACIÓN || fields.APLICACION || fields.APP,
+        timeout: fields.TIMEOUT ? Number(fields.TIMEOUT) : undefined,
+        expected: {
+          name: fields.NOMBRE || fields.NAME,
+          role: fields.ROL || fields.ROLE,
+          state: fields.ESTADO || fields.STATE,
+          absent: String(fields.AUSENTE || fields.ABSENT || '').toLowerCase() === 'true',
+        },
+      };
+
+    case 'process_list':
+      return { query: fields.QUERY, limit: fields.LIMITE ? Number(fields.LIMITE) : undefined };
+
+    case 'process_stop':
+      return { pid: Number(fields.PID) };
+
+    case 'desktop_capabilities':
+    case 'camera_status':
+    case 'open_camera':
+      return {};
+
+    case 'navigate_browser':
+    case 'browser_action':
+      return {
+        action: fields.ACCION?.toLowerCase() || fields.ACTION?.toLowerCase() || 'navigate',
+        url: fields.URL,
+        mode: fields.MODO?.toLowerCase() || fields.MODE?.toLowerCase() || 'background',
+        selector: fields.SELECTOR,
+        role: fields.ROL || fields.ROLE,
+        name: fields.NOMBRE || fields.NAME,
+        text: fields.TEXTO || fields.TEXT,
+        value: fields.VALOR || fields.VALUE,
+        key: fields.TECLA || fields.KEY,
+      };
+
+    case 'apply_patch':
+      return { path: fields.ARCHIVO, patch: fields.PATCH || fields.DIFF };
+
+    case 'run_code':
+      return { code: fields.CÓDIGO || fields.CODIGO || fields.CODE };
+
+    case 'subagent': {
+      const params = {
+        task: fields.TAREA || fields.TASK || fields.CONTENIDO || userGoal || '',
+      };
+      if (fields.CONTEXTO || fields.CONTEXT) params.context = fields.CONTEXTO || fields.CONTEXT;
+      if (fields.AGENT) params.agent = fields.AGENT;
+      if (fields.MAX_ITERATIONS) {
+        const n = Number(fields.MAX_ITERATIONS);
+        if (Number.isInteger(n) && n > 0) params.max_iterations = n;
+      }
+      // PARAMS (JSON) gana sobre los campos sueltos: el LLM nativo suele
+      // mandar { task, agent, context, max_iterations } completo ahí.
+      if (fields.PARAMS) {
+        let parsed = null;
+        try {
+          parsed = typeof fields.PARAMS === 'object' ? fields.PARAMS : JSON.parse(fields.PARAMS);
+        } catch (_) {}
+        if (parsed && typeof parsed === 'object') Object.assign(params, _sanitizeLLMObject(parsed));
+      }
+      return params;
+    }
+
+    default:
+      return { raw: fields };
+  }
+}
+
+// ── Parser principal ──────────────────────────────────────────────────────────
+
+class StructuredActionParser {
+  /**
+   * @param {string} projectCwd — directorio de trabajo del proyecto
+   */
+  constructor(projectCwd = null) {
+    this._cwd = projectCwd;
+  }
+
+  /**
+   * Intenta parsear el bloque de acción estructurado de la respuesta del LLM.
+   *
+   * @param {string} llmResponse — respuesta completa del LLM
+   * @param {string} userGoal    — mensaje original del usuario (para instrucción de edición)
+   * @param {object} toolIntent  — resultado de IntentDetector (opcional, para fallback informado)
+   * @param {object} opts        — opciones de parseo:
+   *   - `skipLegacy: true` → NO aplicar el fallback legacy de prosa (ActionParser).
+   *     Sirve para mensajes que son REPORTES de trabajo ya hecho (p. ej. el
+   *     resumen final de un subagente: "Terminé escribiendo el archivo X...").
+   *     Sin esto, el parser legacy re-detecta una intención de edición sobre ese
+   *     texto y re-ejecuta una acción que el usuario nunca pidió.
+   *
+   * @returns {Array} — array de acciones (compatible con ActionParser original)
+   *                    campo extra `source: 'structured' | 'legacy_regex'`
+   */
+  parse(llmResponse, userGoal = '', toolIntent = null, opts = {}) {
+    // ── 1. Intentar parsear bloque estructurado ───────────────────────────────
+    const structured = this._parseStructuredBlock(llmResponse, userGoal);
+    if (structured.length > 0) {
+      logger.info(
+        'StructuredActionParser',
+        `[structured-parser] Bloque estructurado encontrado: ${structured.map((a) => a.tool).join(', ')}`
+      );
+      return structured;
+    }
+
+    // ── 1b. Modo reporte (subagentes): texto sin bloque de acción = resumen ──
+    // El resumen final de un subagente es un REPORTE de lo que ya hizo, no una
+    // instrucción. Dejarlo pasar por el parser legacy de prosa hace que frases
+    // naturales ("Terminé escribiendo el archivo X", "Hice la modificación de
+    // Y") se reinterpreten como órdenes de edición y se re-ejecute algo no
+    // pedido. En este modo solo se honran bloques estructurados / tool calls.
+    if (opts.skipLegacy) {
+      return [];
+    }
+
+    // ── 2. Fallback: ActionParser original (regex) ────────────────────────────
+    // Solo si no hay bloque estructurado — compatibilidad hacia atrás.
+    try {
+      const { ActionParser } = require('./ActionParser.js');
+      const legacyActions = ActionParser.parse(llmResponse, userGoal);
+
+      if (legacyActions.length > 0) {
+        logger.info(
+          'StructuredActionParser',
+          `[structured-parser] Fallback a ActionParser legacy: ${legacyActions.map((a) => a.tool).join(', ')}`
+        );
+        return legacyActions.map((a) => ({ ...a, source: 'legacy_regex' }));
+      }
+    } catch (e) {
+      logger.warn(
+        'StructuredActionParser',
+        '[structured-parser] Error en ActionParser legacy:',
+        e.message
+      );
+    }
+
+    // ── 3. Si el IntentDetector detectó algo con alta confianza pero el LLM
+    //       no respondió con formato estructurado, lo reportamos para debug.
+    if (toolIntent?.detected && toolIntent.level === 'high') {
+      logger.warn(
+        'StructuredActionParser',
+        `[structured-parser] El LLM ignoró el bloque de acción. ` +
+          `Intent detectado: ${toolIntent.action} (${(toolIntent.confidence * 100).toFixed(0)}%). ` +
+          `El system prompt puede necesitar ajuste.`
+      );
+    }
+
+    return [];
+  }
+
+  /**
+   * Extrae el bloque ```action ... ``` de la respuesta del LLM y lo parsea.
+   * Busca UNO o VARIOS bloques (el LLM puede incluir múltiples acciones).
+   */
+  _parseStructuredBlock(llmResponse, userGoal) {
+    if (!llmResponse) return [];
+
+    // Regex para encontrar bloques ```action ... ```
+    // Usamos un regex simple y robusto — no narrativa libre, solo el bloque delimitado.
+    const BLOCK_RE = /```action\s*\n?([\s\S]*?)```/gi;
+
+    const actions = [];
+    let match;
+
+    while ((match = BLOCK_RE.exec(llmResponse)) !== null) {
+      const blockContent = match[1].trim();
+      const parsed = this._parseBlockContent(blockContent, userGoal);
+      if (parsed) actions.push(parsed);
+    }
+
+    return actions;
+  }
+
+  /**
+   * Parsea el contenido de un bloque individual.
+   *
+   * Formato esperado:
+   *   ACCIÓN: edit_file | ARCHIVO: src/main.js
+   *
+   * Puede venir en múltiples líneas si hay varios campos:
+   *   ACCIÓN: run_command
+   *   COMANDO: npm install express
+   */
+  _parseBlockContent(content, userGoal) {
+    if (!content) return null;
+
+    const fields = {};
+
+    // PARAMS (JSON) se extrae ANTES de la normalización genérica — ver
+    // _extractBalancedJSON arriba para el porqué.
+    let workingContent = content;
+    const paramsExtracted = _extractBalancedJSON(content, 'PARAMS');
+    if (paramsExtracted) {
+      fields['PARAMS'] = paramsExtracted.json;
+      workingContent =
+        content.slice(0, paramsExtracted.fullMatchStart) +
+        content.slice(paramsExtracted.fullMatchEnd);
+    }
+
+    // G.1 + corrupción de "|": CONTENIDO puede ser multilínea (markdown/código)
+    // y contener "|" literales. Se extrae ANTES de la normalización de pipes
+    // (igual que PARAMS) sobre el texto original: el valor empieza tras
+    // "CONTENIDO:" y continúa hasta la siguiente línea "CLAVE: valor" o el final
+    // del bloque. Si se normalizara primero, "||" de JS o "a|b" de regex se
+    // volverían saltos de línea y el archivo quedaría escrito corrupto en disco.
+    const contExtracted =
+      _extractFieldSpan(workingContent, 'CONTENIDO') ||
+      _extractFieldSpan(workingContent, 'CONTENT');
+    if (contExtracted) {
+      fields['CONTENIDO'] = contExtracted.value;
+      workingContent =
+        workingContent.slice(0, contExtracted.start) + workingContent.slice(contExtracted.end);
+    }
+
+    // COMANDO multilínea (p.ej. `node -e` con el script en varias líneas): el
+    // valor se extrae con el mismo span y ANTES de la normalización de pipes,
+    // así un script con `||`/regex no se corrompe y no se trunca en la primera
+    // línea como hacía el parser genérico. Solo cuando el campo está al inicio
+    // de línea: el formato compacto "| COMANDO: x | CWD: y" sigue el camino
+    // genérico (allí el valor es de una línea y el "|" separa campos).
+    const cmdExtracted =
+      _extractFieldSpan(workingContent, 'COMANDO', false) ||
+      _extractFieldSpan(workingContent, 'COMMAND', false);
+    if (cmdExtracted) {
+      fields['COMANDO'] = cmdExtracted.value;
+      workingContent =
+        workingContent.slice(0, cmdExtracted.start) + workingContent.slice(cmdExtracted.end);
+    }
+
+    // Extraer el resto de campos clave:valor separados por "|" o por newlines.
+    // Acá la normalización "|" → salto de línea es segura: workingContent ya no
+    // tiene CONTENIDO, solo los campos cortos tipo ACCIÓN/ARCHIVO de una línea.
+    const normalized = workingContent.replace(/\|/g, '\n');
+
+    for (const line of normalized.split('\n')) {
+      const colonIdx = line.indexOf(':');
+      if (colonIdx === -1) continue;
+
+      const key = line.slice(0, colonIdx).trim().toUpperCase();
+      const value = line.slice(colonIdx + 1).trim();
+
+      if (key && value) fields[key] = value;
+    }
+
+    // Normalize protocol keys, never free text or file content.
+    const canonicalAliases = {
+      COMMAND: 'COMANDO',
+      CONTENT: 'CONTENIDO',
+      FILE: 'ARCHIVO',
+      PATH: 'RUTA',
+      SERVER: 'SERVIDOR',
+      TOOL: 'HERRAMIENTA',
+      INSTRUCTION: 'INSTRUCCION',
+      APPLICATION: 'APLICACION',
+      WINDOW: 'VENTANA',
+      NAME: 'NOMBRE',
+      NEEDS_VERIFICATION: 'VERIFY',
+    };
+    for (const [english, legacy] of Object.entries(canonicalAliases)) {
+      if (!fields[legacy] && fields[english]) fields[legacy] = fields[english];
+    }
+
+    // ACCIÓN es obligatorio.
+    const rawAction = fields['ACCIÓN'] || fields['ACCION'] || fields['ACTION'];
+    let action;
+    if (rawAction) {
+      // Normalizar nombre de acción (el LLM a veces usa mayúsculas o espacios)
+      action = rawAction.toLowerCase().trim().replace(/\s+/g, '_');
+    } else {
+      logger.warn(
+        'StructuredActionParser',
+        '[structured-parser] Bloque sin campo ACCIÓN:',
+        content
+      );
+      return null;
+    }
+
+    const tool = ACTION_TO_TOOL[action];
+    if (!tool) {
+      // Acción desconocida — podría ser answer_question o explain_code, que no tienen herramienta
+      if (action === 'answer_question' || action === 'explain_code') {
+        return null; // No hay herramienta que ejecutar
+      }
+      // 2.2: no descartar en silencio. Se devuelve un marcador con
+      // source:'unrecognized' para que AgentLoop lo convierta en una señal
+      // visible (feedback al LLM / aviso al usuario) en vez de tragárselo.
+      logger.warn(
+        'StructuredActionParser',
+        `[structured-parser] Acción no reconocida: "${action}" — se marca para notificar al usuario`
+      );
+      return {
+        tool: 'unknown_action',
+        params: { action },
+        description: `Acción no reconocida: ${action}`,
+        action,
+        source: 'unrecognized',
+      };
+    }
+
+    // Validaciones mínimas por tipo de acción
+    if (['create_file', 'edit_file', 'read_file', 'delete_file'].includes(action)) {
+      if (!fields.ARCHIVO) {
+        logger.warn('StructuredActionParser', `[structured-parser] ${action} sin campo ARCHIVO`);
+        return null;
+      }
+    }
+
+    if (['run_command', 'run_script', 'git_action', 'install_package', 'exec'].includes(action)) {
+      if (!fields.COMANDO) {
+        logger.warn('StructuredActionParser', `[structured-parser] ${action} sin campo COMANDO`);
+        return null;
+      }
+    }
+
+    if (action === 'web_search' && !fields.QUERY) {
+      logger.warn('StructuredActionParser', '[structured-parser] web_search sin campo QUERY');
+      return null;
+    }
+
+    if (action === 'websearch' && !fields.QUERY) {
+      logger.warn('StructuredActionParser', '[structured-parser] websearch sin campo QUERY');
+      return null;
+    }
+
+    if (action === 'webfetch' && !fields.URL) {
+      logger.warn('StructuredActionParser', '[structured-parser] webfetch sin campo URL');
+      return null;
+    }
+
+    if (
+      action === 'launch_app' &&
+      !fields.APLICACIÓN &&
+      !fields.APLICACION &&
+      !fields.APP &&
+      !fields.APPLICATION &&
+      !fields.NOMBRE &&
+      !fields.NAME
+    ) {
+      logger.warn('StructuredActionParser', '[structured-parser] launch_app sin APLICACIÓN');
+      return null;
+    }
+
+    if (action === 'open_website' && !fields.SITIO && !fields.TARGET && !fields.URL) {
+      logger.warn('StructuredActionParser', '[structured-parser] open_website sin SITIO o URL');
+      return null;
+    }
+
+    if (action === 'play_media' && !fields.QUERY) {
+      logger.warn('StructuredActionParser', '[structured-parser] play_media sin QUERY');
+      return null;
+    }
+
+    if (action === 'navigate_browser' || action === 'browser_action') {
+      if (!fields.URL && !fields.ACCION && !fields.ACTION) {
+        logger.warn('StructuredActionParser', '[structured-parser] browser sin URL ni ACCION');
+        return null;
+      }
+    }
+
+    if (action === 'apply_patch' && !fields.ARCHIVO) {
+      logger.warn('StructuredActionParser', '[structured-parser] apply_patch sin campo ARCHIVO');
+      return null;
+    }
+
+    if (action === 'run_code' && !fields.CÓDIGO && !fields.CODIGO && !fields.CODE) {
+      logger.warn('StructuredActionParser', '[structured-parser] run_code sin campo CÓDIGO');
+      return null;
+    }
+
+    const params = _buildParams(action, fields, userGoal, this._cwd);
+    if (!params) {
+      logger.warn(
+        'StructuredActionParser',
+        `[structured-parser] ${action} descartado — params inválidos tras sanitización`
+      );
+      return null;
+    }
+    const description = _buildDescription(action, fields);
+
+    return {
+      tool,
+      params,
+      stepOrdinal: Number(fields.PASO || fields.STEP || 0) || undefined,
+      description,
+      action, // guardamos la intención original también
+      source: 'structured',
+    };
+  }
+}
+
+// ── Singleton ─────────────────────────────────────────────────────────────────
+let _instance = null;
+
+function getStructuredActionParser(projectCwd = null) {
+  if (!_instance) {
+    _instance = new StructuredActionParser(projectCwd);
+  } else if (projectCwd && _instance._cwd !== projectCwd) {
+    _instance._cwd = projectCwd;
+  }
+  return _instance;
+}
+
+module.exports = { StructuredActionParser, getStructuredActionParser };

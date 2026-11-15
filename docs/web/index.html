@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Conversa, conserva contexto y delega tareas de código y escritorio con Kaoru, un asistente personal de IA con herramientas, memoria, voz y presencia Live2D."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f8f8f7" />
+    <title>Kaoru — Asistente personal de IA con capacidad de agente</title>
+    <link rel="alternate" hreflang="es" href="./index.html" />
+    <link rel="alternate" hreflang="en" href="./en/index.html" />
+    <link rel="alternate" hreflang="ja" href="./ja/index.html" />
+    <link rel="alternate" hreflang="x-default" href="./index.html" />
+    <link rel="stylesheet" href="./assets/styles.css" />
+    <script src="./assets/main.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Ir al contenido</a>
+    <header class="nav">
+      <div class="nav-inner">
+        <a class="nav-logo" href="index.html" aria-label="Kaoru"
+          ><span class="logo-mark" aria-hidden="true">k.</span>Kaoru</a
+        >
+        <nav class="nav-links" id="site-navigation" aria-label="Inicio">
+          <a href="index.html#features">Qué puede hacer</a
+          ><a href="index.html#workflow">Cómo trabaja</a><a href="index.html#security">Seguridad</a
+          ><a href="index.html#requirements">Requisitos</a><a href="guide.html">Guía de uso</a>
+        </nav>
+        <div class="nav-actions">
+          <button
+            class="theme-btn"
+            id="theme-toggle"
+            type="button"
+            aria-label="Cambiar tema"
+            aria-pressed="false"
+          >
+            <span aria-hidden="true">◐</span></button
+          ><button
+            class="theme-btn menu-toggle"
+            type="button"
+            aria-label="Abrir navegación"
+            aria-controls="site-navigation"
+            aria-expanded="false"
+          >
+            <span aria-hidden="true">☰</span></button
+          ><a class="btn-dark nav-github" href="https://github.com/Dregxmoon/Kaoru-Agent"
+            >GitHub <span aria-hidden="true">↗</span></a
+          >
+        </div>
+      </div>
+      <nav class="language-bar" aria-label="Idioma">
+        <a href="./index.html" lang="es" hreflang="es" aria-current="page">Español</a
+        ><a href="./en/index.html" lang="en" hreflang="en">English</a
+        ><a href="./ja/index.html" lang="ja" hreflang="ja">日本語</a>
+      </nav>
+    </header>
+    <main id="main">
+      <section class="hero container">
+        <div class="badge">
+          <span class="status-dot"></span>Código abierto · Asistente personal con capacidad de
+          agente
+        </div>
+        <h1>Tu asistente de IA<br />para código y escritorio.</h1>
+        <p class="hero-intro">
+          Kaoru conversa contigo, recuerda el contexto y te acompaña por texto, voz y presencia
+          Live2D. También puede trabajar como agente: investigar tu proyecto o encadenar resultados
+          en varias aplicaciones de escritorio, con un plan, permisos y comprobaciones visibles.
+        </p>
+        <div class="hero-btns">
+          <a class="btn-dark" href="guide.html"
+            >Empezar con Kaoru<span aria-hidden="true">↗</span></a
+          ><a class="btn-outline" href="#features"
+            >Descubrir qué puede hacer<span aria-hidden="true">↓</span></a
+          >
+        </div>
+        <p class="hero-note">
+          La conversación se escribe en el chat; Kaoru puede responder con voz sintetizada. La
+          interfaz está disponible en español, inglés y japonés desde v2.3.
+        </p>
+        <figure class="avatar-preview">
+          <div class="preview-top"><span class="status-dot"></span>Kaoru <span>Live2D</span></div>
+          <img
+            src="./assets/02-overlay-character.png"
+            width="452"
+            height="693"
+            alt="Avatar Live2D de Kaoru. Puedes elegir otro modelo con sus correspondientes permisos de uso."
+            fetchpriority="high"
+          />
+          <figcaption>
+            Avatar Live2D de Kaoru. Puedes elegir otro modelo con sus correspondientes permisos de
+            uso.
+          </figcaption>
+        </figure>
+      </section>
+      <div class="capability-strip container">
+        <span>Conversación con contexto</span><span>Tareas con herramientas</span
+        ><span>Voz y memoria local</span><span>Presencia Live2D</span>
+      </div>
+      <section id="requirements" class="section">
+        <div class="container">
+          <div class="section-heading fade-up">
+            <span class="eyebrow">KAORU / Requisitos</span>
+            <h2>Qué necesita tu equipo</h2>
+            <p>
+              Mínimos provisionales para usar un proveedor de IA remoto. Son una referencia inicial
+              basada en una medición local de Linux x64; todavía falta validarla en más equipos y
+              plataformas.
+            </p>
+          </div>
+          <div class="grid-2 requirements-grid">
+            <article class="requirements-card fade-up">
+              <h3>Agente y chat por terminal</h3>
+              <p>Sin ventanas, voz ni avatar. Instalación desde el código fuente.</p>
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">Recurso</th>
+                    <th scope="col">Mínimo</th>
+                    <th scope="col">Recomendado</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <th scope="row">RAM</th>
+                    <td>4 GB</td>
+                    <td>8 GB</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">CPU</th>
+                    <td>2 núcleos</td>
+                    <td>4 núcleos</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Disco libre</th>
+                    <td>2 GB</td>
+                    <td>4 GB</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p class="requirements-gpu">GPU dedicada: no se requiere con un proveedor remoto.</p>
+            </article>
+            <article class="requirements-card fade-up">
+              <h3>Escritorio con Live2D</h3>
+              <p>Chat, memoria y avatar; voz opcional.</p>
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">Recurso</th>
+                    <th scope="col">Mínimo</th>
+                    <th scope="col">Recomendado</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <th scope="row">RAM</th>
+                    <td>8 GB</td>
+                    <td>16 GB</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">CPU</th>
+                    <td>2 núcleos</td>
+                    <td>4 núcleos</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Disco libre</th>
+                    <td>3 GB</td>
+                    <td>5 GB</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p class="requirements-gpu">
+                GPU dedicada: no obligatoria; la aceleración gráfica mejora el avatar.
+              </p>
+            </article>
+          </div>
+          <p class="requirements-caveat">
+            La voz, Chromium y los modelos de IA locales pueden necesitar más recursos. El requisito
+            de GPU para un modelo local depende del modelo elegido; aún no hay un mínimo universal
+            medido.
+          </p>
+          <p class="section-link">
+            <a href="https://github.com/Dregxmoon/Kaoru-Agent/blob/produccion/docs/requisitos.md"
+              >Consulta las mediciones y límites de estos valores provisionales
+              <span aria-hidden="true">↗</span></a
+            >
+          </p>
+        </div>
+      </section>
+      <section id="features" class="section sec-alt">
+        <div class="container">
+          <div class="section-heading fade-up">
+            <span class="eyebrow">01 / KAORU</span>
+            <h2>Más que un agente de código</h2>
+            <p>
+              Habla con Kaoru, pídele que recuerde lo importante o delega una tarea de varios pasos.
+              Puede ayudarte en tu proyecto y en el escritorio; las capacidades disponibles dependen
+              del proveedor, el sistema operativo y los permisos que configures.
+            </p>
+          </div>
+          <div class="grid-3">
+            <article class="card fade-up">
+              <span class="card-number">01</span>
+              <h3>Trabajar en un repositorio</h3>
+              <p>
+                Explora archivos, dependencias y símbolos LSP para orientar el plan. Puede leer y
+                editar código, ejecutar comandos y usar Git. El índice estructural es acotado: las
+                referencias y el contenido se confirman con las herramientas del proyecto.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">02</span>
+              <h3>Comprobar los cambios</h3>
+              <p>
+                En el flujo smart, una mutación reconocida activa la verificación configurada. Las
+                pruebas focales compatibles se anteponen a los controles generales; un resultado
+                omitido o fallido no equivale a una prueba pasada.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">03</span>
+              <h3>Retomar un objetivo</h3>
+              <p>
+                Objetivos, pasos y evidencias pueden persistir en SQLite para continuar el trabajo.
+                Si el almacenamiento se degrada a memoria, esa continuidad no sobrevive al cierre de
+                la aplicación.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">04</span>
+              <h3>Conversar con contexto</h3>
+              <p>
+                La memoria local recupera hechos, preferencias y episodios relacionados con la
+                conversación. Puedes pedir que olvide recuerdos. El contexto recuperado puede formar
+                parte de una solicitud al proveedor de IA.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">05</span>
+              <h3>Usar voz y presencia</h3>
+              <p>
+                Edge TTS sintetiza la respuesta mediante un servicio de Microsoft. La entrada por
+                micrófono no está disponible en la interfaz actual. El avatar admite modelos y
+                gestos configurables.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">06</span>
+              <h3>Encadenar tareas de escritorio</h3>
+              <p>
+                Puedes pedir una meta con varios resultados, por ejemplo abrir un informe, crear un
+                recordatorio y confirmar ambos. Kaoru revisa el plan, pide autorización inicial y
+                comprueba cada resultado; si falta evidencia, pausa la misión. Beta: probada con
+                escenarios simulados, aún sin validación externa. La accesibilidad depende de la
+                aplicación y macOS no tiene paridad semántica.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">07</span>
+              <h3>Conectar tus herramientas</h3>
+              <p>
+                GitHub y los plugins locales amplían las tareas disponibles. Revisa los permisos y
+                el origen de cada herramienta antes de usarla.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">08</span>
+              <h3>Recibir sugerencias oportunas</h3>
+              <p>
+                Los sensores configurados aportan señales del sistema y del proyecto. La
+                proactividad evalúa contexto y políticas para proponer ayuda; no concede al modelo
+                nuevos permisos de ejecución.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">09</span>
+              <h3>Elegir dónde responde el modelo</h3>
+              <p>
+                Configura un proveedor compatible o un endpoint local. La calidad, el coste, la
+                visión y la disponibilidad de herramientas dependen del modelo y del servicio
+                seleccionado.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <span class="card-number">10</span>
+              <h3>Terminal y chat juntos</h3>
+              <p>
+                Abre un chat junto a la terminal del mismo proyecto. Puedes adjuntar una selección o
+                salida reciente para revisarla antes de enviarla al modelo; Kaoru no la envía
+                automáticamente. Los comandos de un solo bloque se pueden pegar o ejecutar tras
+                confirmación.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+      <section id="workflow" class="section sec-dark">
+        <div class="container">
+          <div class="section-heading fade-up">
+            <span class="eyebrow">02 / KAORU</span>
+            <h2>De conversar a resolver</h2>
+            <p>
+              Puedes pedir orientación, continuar una conversación o delegar varios resultados en
+              una misión de escritorio. Kaoru interpreta la petición con el modelo elegido, muestra
+              el plan y la actividad en el chat, y mantiene los permisos y la comprobación fuera de
+              la decisión del modelo.
+            </p>
+          </div>
+          <ol class="flow-grid">
+            <li class="fade-up">
+              <span class="step-number">01</span>
+              <h3>Reconocer</h3>
+              <p>
+                Inspecciona el workspace, busca rutas relevantes y consulta símbolos disponibles.
+              </p>
+            </li>
+            <li class="fade-up">
+              <span class="step-number">02</span>
+              <h3>Planificar</h3>
+              <p>Divide el objetivo en resultados observables y revisa si el plan omite alguno.</p>
+            </li>
+            <li class="fade-up">
+              <span class="step-number">03</span>
+              <h3>Autorizar</h3>
+              <p>
+                La misión de escritorio pide autorización inicial; las acciones fuera de su alcance
+                requieren su propio permiso.
+              </p>
+            </li>
+            <li class="fade-up">
+              <span class="step-number">04</span>
+              <h3>Ejecutar</h3>
+              <p>Utiliza herramientas y conserva sus resultados como evidencia del trabajo.</p>
+            </li>
+            <li class="fade-up">
+              <span class="step-number">05</span>
+              <h3>Verificar</h3>
+              <p>
+                Comprueba cada resultado en el entorno; si falta evidencia, la misión se pausa con
+                un paso pendiente.
+              </p>
+            </li>
+          </ol>
+        </div>
+      </section>
+      <section id="security" class="section">
+        <div class="container">
+          <div class="section-heading fade-up">
+            <span class="eyebrow">03 / KAORU</span>
+            <h2>Decide a qué puede acceder</h2>
+            <p>
+              Configura los permisos para tu tarea y tu equipo. La aplicación separa las propuestas
+              del modelo de los controles que autorizan herramientas.
+            </p>
+          </div>
+          <div class="grid-2">
+            <article class="card fade-up security-card">
+              <h3>Permisos por herramienta</h3>
+              <p>
+                Las reglas allow, ask y deny permiten automatizar operaciones concretas, pedir
+                confirmación o bloquearlas. No todas las acciones muestran una pregunta: depende de
+                la política activa.
+              </p>
+            </article>
+            <article class="card fade-up security-card">
+              <h3>Capacidades de escritorio separadas</h3>
+              <p>
+                Aplicaciones, navegador, pantalla, puntero, teclado, procesos y cámara tienen
+                controles independientes. La cámara actual consulta estado o abre su aplicación; no
+                toma fotos ni graba vídeo.
+              </p>
+            </article>
+            <article class="card fade-up security-card">
+              <h3>Aislamiento según el entorno</h3>
+              <p>
+                Las ventanas de Electron están aisladas del acceso directo a Node. El aislamiento de
+                comandos es otro mecanismo y depende de las capacidades y configuración del sistema.
+              </p>
+            </article>
+            <article class="card fade-up security-card">
+              <h3>Checkpoint y recuperación</h3>
+              <p>
+                Kaoru captura una línea base para cambios reconocidos. La recuperación tiene
+                límites: acciones remotas, comandos arbitrarios y efectos externos pueden no ser
+                reversibles.
+              </p>
+            </article>
+            <article class="card fade-up security-card">
+              <h3>Contenido externo</h3>
+              <p>
+                Resultados web y de integraciones se tratan como contenido no confiable en los
+                flujos que lo delimitan. Estos controles reducen riesgo de instrucciones maliciosas;
+                no garantizan inmunidad.
+              </p>
+            </article>
+            <article class="card fade-up security-card">
+              <h3>Datos y credenciales</h3>
+              <p>
+                Memoria y embeddings se almacenan localmente. El prompt puede salir al proveedor
+                elegido. El llavero del sistema se usa cuando está disponible; los respaldos de
+                configuración requieren cuidado.
+              </p>
+            </article>
+          </div>
+          <p class="section-link">
+            <a href="privacy.html"
+              >Leer qué datos se guardan y cuáles salen del equipo
+              <span aria-hidden="true">↗</span></a
+            >
+          </p>
+        </div>
+      </section>
+      <section class="section sec-alt" id="users">
+        <div class="container">
+          <div class="section-heading fade-up">
+            <span class="eyebrow">04 / KAORU</span>
+            <h2>Una configuración para cada forma de trabajar</h2>
+          </div>
+          <div class="grid-3">
+            <article class="card fade-up">
+              <h3>Para uso personal</h3>
+              <p>
+                Empieza con conversación, un workspace concreto y los permisos que necesites. Activa
+                voz, memoria o sugerencias según tu rutina; puedes cambiar el modelo Live2D.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <h3>Para desarrollo</h3>
+              <p>
+                Declara las reglas del repositorio, prepara las dependencias y configura comandos de
+                verificación. Revisa el diff y los resultados antes de integrar cambios importantes.
+              </p>
+            </article>
+            <article class="card fade-up">
+              <h3>Para equipos y clientes</h3>
+              <p>
+                Define qué información puede enviarse al proveedor, quién administra las claves y
+                qué herramientas se permiten. La licencia del código no incluye los personajes ni
+                sustituye las políticas de tu organización.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+      <section class="section" id="screenshots">
+        <div class="container">
+          <div class="section-heading fade-up">
+            <h2>El producto en tu escritorio</h2>
+            <p>
+              Capturas reales del proyecto. La apariencia puede variar según el modelo y la
+              configuración.
+            </p>
+          </div>
+          <div class="grid-2 gallery">
+            <figure class="fade-up">
+              <img
+                src="./assets/03-chat-bienvenida.png"
+                alt="Pantalla de bienvenida de Kaoru"
+                loading="lazy"
+              />
+              <figcaption>Pantalla de bienvenida de Kaoru</figcaption>
+            </figure>
+            <figure class="fade-up">
+              <img
+                src="./assets/07-propuesta.png"
+                alt="Propuesta de ayuda en Kaoru"
+                loading="lazy"
+              />
+              <figcaption>Propuesta de ayuda en Kaoru</figcaption>
+            </figure>
+          </div>
+        </div>
+      </section>
+      <section class="section sec-dark" id="quickstart">
+        <div class="container quickstart fade-up">
+          <span class="eyebrow">KAORU / Guía de uso</span>
+          <h2>Empieza conversando. Delega cuando lo necesites.</h2>
+          <p>
+            Elige un proveedor y un proyecto. Puedes comenzar con una pregunta o pedir un resultado
+            pequeño que puedas comprobar. La guía incluye instalación, permisos y límites por
+            plataforma.
+          </p>
+          <ol>
+            <li>Instala y abre Kaoru.</li>
+            <li>Configura el proveedor y selecciona el workspace.</li>
+            <li>Pide un análisis de lectura antes de permitir cambios.</li>
+          </ol>
+          <div class="hero-btns">
+            <a class="btn-dark" href="guide.html"
+              >Empezar con Kaoru <span aria-hidden="true">↗</span></a
+            ><a
+              class="btn-outline"
+              href="https://github.com/Dregxmoon/Kaoru-Agent/blob/produccion/docs/README.md"
+              >Referencia técnica</a
+            >
+          </div>
+        </div>
+      </section>
+    </main>
+    <footer>
+      <div class="container footer-top">
+        <a class="nav-logo" href="index.html"
+          ><span class="logo-mark" aria-hidden="true">k.</span>Kaoru</a
+        >
+        <nav aria-label="Términos y licencia">
+          <a href="index.html" aria-current="page">Inicio</a><a href="guide.html">Guía de uso</a
+          ><a href="manual.html">Manual de uso</a><a href="privacy.html">Privacidad</a
+          ><a href="terms.html">Términos y licencia</a
+          ><a href="mailto:dregxmoon@gmail.com">dregxmoon@gmail.com</a>
+        </nav>
+      </div>
+      <div class="container footer-bottom">
+        <p>Kaoru · Código bajo licencia MIT</p>
+        <p>
+          Los modelos y personajes de terceros mantienen sus propios derechos. Proyecto
+          independiente, sin afiliación con HoYoverse.
+        </p>
+      </div>
+    </footer>
+  </body>
+</html>

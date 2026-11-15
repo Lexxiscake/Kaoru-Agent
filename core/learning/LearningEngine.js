@@ -1,0 +1,563 @@
+// @ts-check
+'use strict';
+
+/**
+ * LearningEngine.js — Fase 3, ítem 2: el aprendizaje que cierra el círculo.
+ *
+ * Conecta dos fuentes de feedback con dos salidas:
+ *
+ *   Feedback de proactividad  → pesos de scoring recalibrados
+ *     (ProposalStore)           (DecisionCore.deriveWeights) → gate de relevancia
+ *
+ *   Evaluación de tareas      → sección "# LO APRENDIDO" en el prompt
+ *     (outcomes de agent.js)    (éxito/fracaso por modo) → el modelo evita
+ *                               repetir errores y refuerza lo que funciona.
+ *
+ * Persistencia en JSON (data/learning_feedback.json) con el mismo patrón
+ * nunca-lanza de ProposalStore: cualquier fallo de disco degrada a memoria y
+ * el asistente sigue funcionando. Los pesos aprendidos se MIERAN también al
+ * ProposalStore (setLearnedWeights) porque es ahí donde el gate los lee.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const logger = require('../observability/Logger.js');
+const DecisionCore = require('../decision/DecisionCore.js');
+
+const DEFAULT_PATH = path.join(__dirname, '..', '..', 'data', 'learning_feedback.json');
+
+// Cuántos outcomes de tarea se conservan en disco (circular, FIFO).
+const MAX_TASK_OUTCOMES = 500;
+
+/**
+ * Interface mínima de ProposalStore usada por el LearningEngine (el archivo
+ * original es @ts-nocheck, así que se describe estructuralmente aquí).
+ * @typedef {{
+ *   getStats: () => { byType?: Record<string, {accepted?: number, rejected?: number, ignored?: number}> },
+ *   setLearnedWeights: (weights: object | null) => void,
+ * }} ProposalStoreLike
+ */
+
+/**
+ * @typedef {object} TaskOutcome
+ * @property {number} ts
+ * @property {string} mode
+ * @property {string|null} provider
+ * @property {string|null} model
+ * @property {boolean} success
+ * @property {string|null} error
+ * @property {number|null} iterations
+ * @property {number|null} elapsedMs
+ * @property {number|null} difficulty
+ * @property {string} goal
+ * @property {boolean} [terminalSuccess]
+ * @property {string} [verificationStatus]
+ * @property {string} [verificationReason]
+ * @property {number} [mutationCount]
+ * @property {boolean} [rollbackAvailable]
+ * @property {string[]} [skills]
+ * @property {string[]} [capabilities]
+ * @property {string[]} [toolSequence]
+ * @property {string|null} [taskDomain]
+ */
+
+/**
+ * @typedef {object} ReflectionProposal
+ * @property {string} id
+ * @property {number} version
+ * @property {string} kind
+ * @property {string} signature
+ * @property {string} hypothesis
+ * @property {{instruction:string}} proposedChange
+ * @property {Array<{ts:number, goal:string, verificationStatus?:string}>} evidence
+ * @property {'proposed'|'approved'|'rejected'|'superseded'} status
+ * @property {number} createdAt
+ * @property {number|null} decidedAt
+ */
+
+/** @typedef {object} LearningData
+ *  @property {object|null} learnedWeights
+ *  @property {TaskOutcome[]} taskOutcomes
+ *  @property {ReflectionProposal[]} reflectionProposals
+ *  @property {number|null} updatedAt
+ */
+
+/**
+ * Mensaje seguro de un `catch` (tipo `unknown` con el tsconfig actual).
+ * @param {unknown} e
+ * @returns {string}
+ */
+function _errMsg(e) {
+  return e instanceof Error ? e.message : String(e);
+}
+
+class LearningEngine {
+  /**
+   * @param {object} opts
+   * @param {string} [opts.filePath]      Ruta del JSON (inyectable en tests).
+   * @param {ProposalStoreLike} [opts.proposalStore] ProposalStore con getStats/setLearnedWeights.
+   */
+  constructor({ filePath, proposalStore } = {}) {
+    this._filePath = filePath || DEFAULT_PATH;
+    this._proposalStore = proposalStore || null;
+    this._data = /** @type {LearningData} */ ({
+      learnedWeights: null,
+      taskOutcomes: [],
+      reflectionProposals: [],
+      updatedAt: null,
+    });
+    this._inMem = false;
+    this._load();
+  }
+
+  _load() {
+    try {
+      if (this._filePath && fs.existsSync(this._filePath)) {
+        const raw = JSON.parse(fs.readFileSync(this._filePath, 'utf-8'));
+        if (raw && typeof raw === 'object') {
+          this._data = {
+            learnedWeights: raw.learnedWeights || null,
+            taskOutcomes: Array.isArray(raw.taskOutcomes) ? raw.taskOutcomes : [],
+            reflectionProposals: Array.isArray(raw.reflectionProposals)
+              ? raw.reflectionProposals
+              : [],
+            updatedAt: raw.updatedAt || null,
+          };
+        }
+      }
+    } catch (e) {
+      logger.warn('LearningEngine', '[learning] no se pudo leer feedback previo:', _errMsg(e));
+      this._inMem = true;
+    }
+  }
+
+  _persist() {
+    if (this._inMem || !this._filePath) return;
+    try {
+      fs.mkdirSync(path.dirname(this._filePath), { recursive: true });
+      fs.writeFileSync(this._filePath, JSON.stringify(this._data, null, 2));
+    } catch (e) {
+      logger.warn('LearningEngine', '[learning] no se pudo persistir feedback:', _errMsg(e));
+      this._inMem = true;
+    }
+  }
+
+  // ── Feedback de proactividad → pesos ───────────────────────────────────────
+
+  /**
+   * Recalibra los pesos de scoring desde las stats del ProposalStore y los
+   * escribe (a) en el propio LearningEngine y (b) en el ProposalStore, que es
+   * la fuente que lee el gate. Sin muestras suficientes es identidad.
+   * @returns {object} pesos { severity, actionability, salience, costOfIgnore }
+   */
+  calibrate() {
+    const stats =
+      this._proposalStore && typeof this._proposalStore.getStats === 'function'
+        ? this._proposalStore.getStats()
+        : {};
+    const weights = DecisionCore.deriveWeights(stats || {}, {});
+    this._data.learnedWeights = weights;
+    this._data.updatedAt = Date.now();
+    if (this._proposalStore && typeof this._proposalStore.setLearnedWeights === 'function') {
+      this._proposalStore.setLearnedWeights(weights);
+    }
+    this._persist();
+    return weights;
+  }
+
+  /** Pesos vigentes (los que el gate aplica). */
+  getLearnedWeights() {
+    return this._data.learnedWeights;
+  }
+
+  // ── Evaluación de tareas → prompt ──────────────────────────────────────────
+
+  /**
+   * @param {object} outcome
+   * @param {string} [outcome.mode]      'smart' | 'fast' | 'agent' ...
+   * @param {string} [outcome.provider]  provider activo (groq/openai/...)
+   * @param {string} [outcome.model]     modelo usado
+   * @param {boolean} [outcome.success]  completó o no
+   * @param {string} [outcome.error]     motivo de fallo (si falló)
+   * @param {number} [outcome.iterations] iteraciones del loop (si aplica)
+   * @param {number} [outcome.elapsedMs] duración
+   * @param {number} [outcome.difficulty] estimación 0..1 (ver difficulty.js)
+   * @param {string} [outcome.goal]      resumen del objetivo
+   * @param {boolean} [outcome.terminalSuccess]
+   * @param {string} [outcome.verificationStatus]
+   * @param {string} [outcome.verificationReason]
+   * @param {number} [outcome.mutationCount]
+   * @param {boolean} [outcome.rollbackAvailable]
+   * @param {string[]} [outcome.skills]
+   * @param {string[]} [outcome.capabilities]
+   * @param {string[]} [outcome.toolSequence]
+   * @param {string|null} [outcome.taskDomain]
+   * @returns {object} el outcome persistido
+   */
+  recordTaskOutcome(outcome = {}) {
+    const entry = /** @type {TaskOutcome} */ ({
+      ts: Date.now(),
+      mode: outcome.mode || 'unknown',
+      provider: outcome.provider || null,
+      model: outcome.model || null,
+      success: !!outcome.success,
+      terminalSuccess:
+        outcome.terminalSuccess === undefined ? !!outcome.success : !!outcome.terminalSuccess,
+      error: outcome.error || null,
+      verificationStatus: outcome.verificationStatus || 'unknown',
+      verificationReason: outcome.verificationReason || null,
+      mutationCount: Math.max(0, Number(outcome.mutationCount) || 0),
+      rollbackAvailable: !!outcome.rollbackAvailable,
+      iterations: outcome.iterations ?? null,
+      elapsedMs: outcome.elapsedMs ?? null,
+      difficulty: outcome.difficulty ?? null,
+      goal: String(outcome.goal || '').slice(0, 160),
+      // Loop de feedback de SKILLS: qué skills estaban inyectadas en este run
+      // (correlación skill → outcome que alimenta skillStats()/SkillManager).
+      skills: Array.isArray(outcome.skills)
+        ? outcome.skills.slice(0, 5).map((s) => String(s).slice(0, 60))
+        : [],
+      capabilities: Array.isArray(outcome.capabilities)
+        ? [...new Set(outcome.capabilities.map((item) => String(item).slice(0, 140)))].slice(0, 30)
+        : [],
+      toolSequence: Array.isArray(outcome.toolSequence)
+        ? outcome.toolSequence.map((item) => String(item).slice(0, 80)).slice(0, 30)
+        : [],
+      taskDomain: outcome.taskDomain ? String(outcome.taskDomain).slice(0, 80) : null,
+    });
+    this._data.taskOutcomes.push(entry);
+    if (this._data.taskOutcomes.length > MAX_TASK_OUTCOMES) {
+      this._data.taskOutcomes.splice(0, this._data.taskOutcomes.length - MAX_TASK_OUTCOMES);
+    }
+    this._maybeProposeReflection(entry);
+    this._persist();
+    return entry;
+  }
+
+  /**
+   * Crea una propuesta de estrategia después de tres fallos equivalentes.
+   * La propuesta queda inerte hasta que otra capa la apruebe explícitamente.
+   * @param {TaskOutcome} entry
+   */
+  _maybeProposeReflection(entry) {
+    if (entry.success) return null;
+    if (!['failed', 'unverified'].includes(entry.verificationStatus || '')) return null;
+    const rawReason = entry.verificationReason || entry.error || 'unknown_failure';
+    const reason = String(rawReason)
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '_')
+      .slice(0, 80);
+    const signature = `${entry.mode}:${reason}`;
+    const matching = this._data.taskOutcomes.filter((outcome) => {
+      const otherReason = String(outcome.verificationReason || outcome.error || 'unknown_failure')
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, '_')
+        .slice(0, 80);
+      return !outcome.success && `${outcome.mode}:${otherReason}` === signature;
+    });
+    if (matching.length < 3) return null;
+    const prior = this._data.reflectionProposals
+      .filter((proposal) => proposal.signature === signature)
+      .sort((a, b) => b.version - a.version)[0];
+    if (prior && prior.status !== 'rejected') return prior;
+    if (prior) {
+      const freshFailures = matching.filter((outcome) => outcome.ts > (prior.decidedAt || 0));
+      if (freshFailures.length < 3) return null;
+    }
+    const version = prior ? prior.version + 1 : 1;
+    const id = crypto
+      .createHash('sha256')
+      .update(`${signature}:${version}`)
+      .digest('hex')
+      .slice(0, 16);
+    const proposal = /** @type {ReflectionProposal} */ ({
+      id,
+      version,
+      kind: 'strategy',
+      signature,
+      hypothesis: `La estrategia actual repitió el fallo "${reason}" al menos 3 veces.`,
+      proposedChange: {
+        instruction: `Cuando aparezca "${reason}", revisa la evidencia del último intento y cambia de estrategia antes de repetir la misma acción.`,
+      },
+      evidence: matching.slice(-5).map((outcome) => ({
+        ts: outcome.ts,
+        goal: outcome.goal,
+        verificationStatus: outcome.verificationStatus,
+      })),
+      status: 'proposed',
+      createdAt: Date.now(),
+      decidedAt: null,
+    });
+    this._data.reflectionProposals.push(proposal);
+    return proposal;
+  }
+
+  /** @param {{status?:string}} [opts] */
+  listReflectionProposals({ status } = {}) {
+    const list = this._data.reflectionProposals || [];
+    const filtered = status ? list.filter((proposal) => proposal.status === status) : list;
+    return filtered.map((proposal) => JSON.parse(JSON.stringify(proposal)));
+  }
+
+  /**
+   * Único gate que activa una reflexión. La decisión debe provenir de una
+   * acción explícita del usuario/UI; este método no se llama automáticamente.
+   * @param {string} id
+   * @param {'approved'|'rejected'} decision
+   */
+  decideReflection(id, decision) {
+    if (!['approved', 'rejected'].includes(decision)) return false;
+    const proposal = this._data.reflectionProposals.find((item) => item.id === id);
+    if (!proposal || proposal.status !== 'proposed') return false;
+    proposal.status = decision;
+    proposal.decidedAt = Date.now();
+    this._data.updatedAt = Date.now();
+    this._persist();
+    return true;
+  }
+
+  /**
+   * @param {object} [opts]
+   * @param {number} [opts.limit]
+   * @param {string|null} [opts.mode]
+   * @returns {TaskOutcome[]}
+   */
+  getTaskOutcomes({ limit = 20, mode = null } = {}) {
+    let list = this._data.taskOutcomes;
+    if (mode) list = list.filter((o) => o.mode === mode);
+    return list.slice(-limit);
+  }
+
+  /**
+   * Loop de feedback de SKILLS: estadísticas de éxito por skill inyectada,
+   * agregadas sobre taskOutcomes. Es lo que SkillManager usa para ajustar
+   * umbral/ranking — las skills útiles en la práctica entran más fácil y
+   * suben en el ranking, más allá de su cercanía semántica.
+   * @param {{ minUses?: number }} [opts]
+   * @returns {Record<string, { uses: number, successes: number, rate: number, consecutiveFailures:number, suspended:boolean }>}
+   */
+  skillStats({ minUses = 1 } = {}) {
+    const tally = new Map();
+    for (const o of this._data.taskOutcomes) {
+      if (!Array.isArray(o.skills)) continue;
+      for (const name of o.skills) {
+        const cur = tally.get(name) || { uses: 0, successes: 0 };
+        cur.uses += 1;
+        if (o.success) cur.successes += 1;
+        tally.set(name, cur);
+      }
+    }
+    /** @type {Record<string, { uses: number, successes: number, rate: number, consecutiveFailures:number, suspended:boolean }>} */
+    const out = {};
+    for (const [name, s] of tally) {
+      if (s.uses < minUses) continue;
+      let consecutiveFailures = 0;
+      for (const outcome of [...this._data.taskOutcomes].reverse()) {
+        if (!outcome.skills?.includes(name)) continue;
+        if (outcome.success) break;
+        consecutiveFailures++;
+      }
+      const rate = s.successes / s.uses;
+      out[name] = {
+        uses: s.uses,
+        successes: s.successes,
+        rate,
+        consecutiveFailures,
+        suspended: s.uses >= 5 && rate <= 0.2 && consecutiveFailures >= 3,
+      };
+    }
+    return out;
+  }
+
+  /** Estadísticas observables para el router de capacidades. */
+  capabilityStats({ minUses = 1 } = {}) {
+    const tally = new Map();
+    for (const outcome of this._data.taskOutcomes) {
+      for (const key of outcome.capabilities || []) {
+        const current = tally.get(key) || { uses: 0, successes: 0, elapsedMs: 0, timed: 0 };
+        current.uses++;
+        if (outcome.success) current.successes++;
+        if (Number.isFinite(outcome.elapsedMs)) {
+          current.elapsedMs += Number(outcome.elapsedMs);
+          current.timed++;
+        }
+        tally.set(key, current);
+      }
+    }
+    /** @type {Record<string, { uses: number; successRate: number; averageLatencyMs: number|null }>} */
+    const stats = {};
+    for (const [key, value] of tally) {
+      if (value.uses < minUses) continue;
+      stats[key] = {
+        uses: value.uses,
+        successRate: value.successes / value.uses,
+        averageLatencyMs: value.timed ? Math.round(value.elapsedMs / value.timed) : null,
+      };
+    }
+    return stats;
+  }
+
+  /** Recupera una secuencia verificada, sin convertirla en autorización.
+   * @param {{ domain?: string|null; minSuccesses?: number }} [options]
+   */
+  recommendStrategy({ domain = null, minSuccesses = 2 } = {}) {
+    if (!domain) return null;
+    const groups = new Map();
+    for (const outcome of this._data.taskOutcomes) {
+      if (
+        !outcome.success ||
+        outcome.verificationStatus !== 'verified' ||
+        outcome.taskDomain !== domain ||
+        !outcome.toolSequence?.length
+      ) {
+        continue;
+      }
+      const signature = outcome.toolSequence.join(' → ');
+      const current = groups.get(signature) || { successes: 0, totalMs: 0 };
+      current.successes++;
+      current.totalMs += Number(outcome.elapsedMs) || 0;
+      groups.set(signature, current);
+    }
+    const ranked = [...groups.entries()]
+      .filter(([, value]) => value.successes >= minSuccesses)
+      .sort((a, b) => b[1].successes - a[1].successes || a[1].totalMs - b[1].totalMs);
+    if (!ranked.length) return null;
+    const [sequence, stats] = ranked[0];
+    return {
+      domain,
+      sequence: sequence.split(' → '),
+      successes: stats.successes,
+      averageLatencyMs: Math.round(stats.totalMs / stats.successes),
+    };
+  }
+
+  /**
+   * Tasa de éxito reciente. Devuelve null si no hay suficientes muestras
+   * (minSamples), para que buildPromptSection no hable de datos ruidosos.
+   * @param {object} [opts]
+   * @param {string|null} [opts.mode]
+   * @param {number} [opts.minSamples]
+   * @returns {number|null}
+   */
+  successRate({ mode = null, minSamples = 5 } = {}) {
+    let list = this._data.taskOutcomes;
+    if (mode) list = list.filter((o) => o.mode === mode);
+    if (list.length < minSamples) return null;
+    return list.filter((o) => o.success).length / list.length;
+  }
+
+  /**
+   * Dificultad de una tarea CALIBRADA con los outcomes reales del modo: el
+   * heurístico de difficulty.js es la línea base y el historial lo ajusta de
+   * forma acotada. Si el modo tiene baja tasa de éxito reciente, la tarea
+   * probablemente sea más dura de lo que sugiere la heurística (y viceversa).
+   * Se usa para el gate de planificación, el routing de confianza y la
+   * evaluación de outcomes — así el presupuesto sigue al feedback real.
+   * @param {object} [opts]
+   * @param {string} [opts.message]
+   * @param {object|null} [opts.taskIntent]
+   * @param {number} [opts.messageCount]
+   * @param {string} [opts.mode] modo a calibrar ('smart' | 'fast' | ...)
+   * @returns {number} dificultad en [0, 1]
+   */
+  calibratedDifficulty({ message = '', taskIntent = null, messageCount = 0, mode = 'smart' } = {}) {
+    const { estimateDifficulty } = require('./difficulty.js');
+    const base = estimateDifficulty({ message, taskIntent, messageCount });
+    const rate = this.successRate({ mode, minSamples: 8 });
+    if (rate === null) return base;
+    const adjusted = Math.min(1, Math.max(0, base + (0.5 - rate) * 0.3));
+    return Math.round(adjusted * 100) / 100;
+  }
+
+  /**
+   * Sección corta de prompt con lo aprendido. Solo incluye datos con muestras
+   * suficientes; si no hay nada significativo devuelve null (no se inyecta).
+   * @param {{ domain?: string|null }} [options]
+   * @returns {string|null}
+   */
+  buildPromptSection(options = {}) {
+    const lines = [];
+
+    // Preferencias de proactividad aprendidas del feedback de propuestas.
+    if (this._proposalStore && typeof this._proposalStore.getStats === 'function') {
+      const byType = this._proposalStore.getStats().byType || {};
+      const low = [];
+      const high = [];
+      for (const [type, t] of Object.entries(byType)) {
+        if (!t || typeof t !== 'object') continue;
+        const total = (t.accepted || 0) + (t.rejected || 0) + (t.ignored || 0);
+        if (total < 3) continue;
+        const ratio = (t.accepted || 0) / total;
+        if (ratio < 0.25) low.push(type);
+        else if (ratio > 0.75) high.push(type);
+      }
+      if (low.length)
+        lines.push(
+          `Al usuario no le gustan las sugerencias de tipo: ${low.join(', ')} — evítalas.`
+        );
+      if (high.length)
+        lines.push(`Al usuario le resultan útiles las sugerencias de tipo: ${high.join(', ')}.`);
+    }
+
+    // Tasa de éxito por modo de tarea.
+    const smart = this.successRate({ mode: 'smart' });
+    if (smart !== null)
+      lines.push(`Tareas "smart" recientes completadas con éxito: ${Math.round(smart * 100)}%.`);
+    const fast = this.successRate({ mode: 'fast' });
+    if (fast !== null)
+      lines.push(`Tareas "fast" recientes completadas con éxito: ${Math.round(fast * 100)}%.`);
+
+    // Solo estrategias aprobadas explícitamente. Las propuestas pendientes
+    // jamás influyen en conducta, permisos o selección de herramientas.
+    for (const proposal of this._data.reflectionProposals.filter(
+      (item) => item.status === 'approved'
+    )) {
+      const instruction = proposal.proposedChange?.instruction;
+      if (instruction) lines.push(`Estrategia aprobada v${proposal.version}: ${instruction}`);
+    }
+
+    const strategy = this.recommendStrategy({ domain: options.domain || null });
+    if (strategy) {
+      lines.push(
+        `Ruta verificada para ${strategy.domain} (${strategy.successes} éxitos): ${strategy.sequence.join(' → ')}. Adáptala al objetivo actual y conserva los permisos.`
+      );
+    }
+
+    if (!lines.length) return null;
+    return '# LO APRENDIDO (FEEDBACK)\n' + lines.map((l) => '  - ' + l).join('\n') + '\n';
+  }
+
+  getData() {
+    return {
+      learnedWeights: this._data.learnedWeights,
+      taskOutcomes: this._data.taskOutcomes.slice(-20),
+      reflectionProposals: this._data.reflectionProposals
+        .slice(-20)
+        .map((proposal) => JSON.parse(JSON.stringify(proposal))),
+      updatedAt: this._data.updatedAt,
+      filePath: this._filePath,
+      inMemoryOnly: this._inMem,
+    };
+  }
+
+  reset() {
+    this._data = {
+      learnedWeights: null,
+      taskOutcomes: [],
+      reflectionProposals: [],
+      updatedAt: null,
+    };
+    this._inMem = false;
+    if (this._proposalStore && typeof this._proposalStore.setLearnedWeights === 'function') {
+      this._proposalStore.setLearnedWeights(null);
+    }
+    if (this._filePath) {
+      try {
+        fs.rmSync(this._filePath, { force: true });
+      } catch {}
+    }
+  }
+}
+
+module.exports = { LearningEngine, MAX_TASK_OUTCOMES };

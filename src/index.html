@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<!-- CSP: Fase 1 — webSecurity:true + libs locales (sin CDN). 'self' cubre
+     los scripts de node_modules y los modelos Live2D locales. file: sigue
+     en connect/img para el modelo y sus texturas. 'unsafe-inline' es
+     necesario mientras todo el JS viva inline; 'unsafe-eval' para el
+     loader mínimo de módulos core de la página. -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  script-src 'self' 'unsafe-inline' 'unsafe-eval';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: file: blob:;
+  connect-src 'self' file: data: blob:;
+  media-src 'self' file: data: blob:;
+  object-src 'none';
+  base-uri 'none';
+">
+<title>Kaoru — Avatar</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: transparent;
+  }
+  #live2d-canvas {
+    width: 100%; height: 100%;
+    display: block;
+    position: absolute; top: 0; left: 0;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="live2d-canvas"></canvas>
+
+<script src="../vendor/live2dcubismcore.min.js"></script>
+<script src="../node_modules/pixi.js/dist/browser/pixi.min.js"></script>
+<script src="../node_modules/pixi-live2d-display/dist/cubism4.min.js"></script>
+
+<script>
+// Sandbox: la página no tiene require() ni Node. Todo llega acotado desde el
+// preload vía window.assistant (contextBridge). ipcRenderer es el wrapper con
+// la misma firma (invoke/send/on) que el original. Usamos `var` (no const)
+// porque contextBridge define window.assistant como propiedad no-configurable
+// y una `const assistant` en ámbito global lanza "Identifier 'assistant' has
+// already been declared" (HasRestrictedGlobalProperty).
+var assistant     = window.assistant;
+const ipcRenderer  = assistant;
+
+// sandbox:true (Fase 2, ítem 6): el preload ya no expone fs/ModelAugmenter/
+// ttsStream — la lógica Node del overlay vive en ipc/overlay-handlers.js y
+// llega como llamadas IPC. La página conserva los mismos nombres, ahora
+// asíncronos (invoke → Promise). fs.existsSync se usa con `await` en
+// loadModel; ModelAugmenter y ttsStream ya se consumían en funciones async.
+const fs           = { existsSync: (p) => ipcRenderer.invoke('overlay-fs-exists', p) };
+const ModelAugmenter = {
+  augmentModel: (p) => ipcRenderer.invoke('overlay-augment-model', p),
+  listGestures: (p) => ipcRenderer.invoke('overlay-list-gestures', p),
+};
+const ttsStream    = (args) => ipcRenderer.invoke('overlay-tts-stream', args);
+
+// Loader mínimo de módulos core propios en la página. Las clases como
+// GestureEngine DEBEN ejecutarse aquí: reciben el objeto Live2D real (creado
+// por PIXI en la página) que no puede cruzar el contextBridge, y `new` no
+// funciona sobre los proxies del bridge. Con sandbox:true los fuentes llegan
+// en un LOTE vía IPC (overlay-core-sources) y el loader los resuelve en
+// síncrono — necesario porque GestureEngine.js hace `require()` en top-level
+// al ejecutarse. ModelAugmenter se resuelve al proxy IPC expuesto arriba
+// (llamadas a métodos, no constructor). Esto no le da a la página —ni a los
+// scripts remotos de los CDN— acceso a Node.
+let __coreSources = null;
+async function initCoreSources() {
+  if (!__coreSources) __coreSources = await ipcRenderer.invoke('overlay-core-sources').catch(() => ({}));
+  return __coreSources;
+}
+const __coreLoader = (() => {
+  const cache = {};
+  const load = (name) => {
+    const key = String(name).replace(/^\.\//, '').replace(/\.js$/, '');
+    if (cache[key]) return cache[key].exports;
+    if (key === 'ModelAugmenter') return ModelAugmenter;
+    const source = __coreSources && __coreSources[key];
+    if (source == null) throw new Error('Módulo core no permitido en la página: ' + name);
+    const module = { exports: {} };
+    cache[key] = module;
+    new Function('require', 'module', 'exports', source)(load, module, module.exports);
+    return module.exports;
+  };
+  return load;
+})();
+async function getGestureEngine() {
+  await initCoreSources();
+  return __coreLoader('./GestureEngine.js');
+}
+
+window.PIXI = PIXI;
+
+// Motor de gestos del overlay: reacciona al tono de voz (speak → setEmotion),
+// a los eventos globales que main.js reenvía por IPC 'gesture', y opcionalmente
+// al ambient idle. La config viene del bloque `gestures` del config.json.
+let gestureEngine = null;
+let gestureConfig = null;
+let _gestureCfgPromise = null;
+function getGestureConfig() {
+  if (!_gestureCfgPromise) {
+    _gestureCfgPromise = ipcRenderer.invoke('gesture-config').catch(() => null);
+  }
+  return _gestureCfgPromise;
+}
+async function initGestureEngine() {
+  if (gestureEngine) return gestureEngine;
+  const cfg = await getGestureConfig() || {};
+  gestureConfig = cfg;
+  const GE = await getGestureEngine();
+  gestureEngine = new GE({ config: cfg });
+  return gestureEngine;
+}
+
+// P1: antes esto hacía cp.spawn('python', ...) directo — 'python' no existe
+// en la mayoría de Linux de fábrica (solo 'python3'), así que el TTS se
+// quedaba mudo ahí aunque el resto del asistente funcionara bien. main.js ya
+// tiene resolvePythonBin(), que prueba 'py'/'python'/'python3' de forma
+// portable — este es el mismo patrón que ya usa chat.html (ver
+// getPythonBin() ahí) para pedirlo una sola vez por IPC y cachearlo, en vez
+// de duplicar la resolución en el renderer.
+let _pythonBinPromise = null;
+function getPythonBin() {
+  if (!_pythonBinPromise) _pythonBinPromise = ipcRenderer.invoke('get-python-bin').catch(() => null);
+  return _pythonBinPromise;
+}
+
+let _modelInfo  = null;
+let _idleTimer  = null;
+let canvas       = document.getElementById('live2d-canvas');
+const TTS_VOICE  = 'ja-JP-NanamiNeural';
+
+let pixiApp, model;
+let currentView   = 'full';
+let isDragging    = false;
+let dragMoved     = false;
+let isSpeaking    = false;
+let audioCtx      = null;
+
+// Auto-fit por contenido real del modelo (bounds del mesh, no del canvas).
+// Concepto "piso": el borde inferior de la ventana es el corte del cuerpo.
+//   full: f=1.0 → los pies tocan el piso (cuerpo completo).
+//   half: f=0.5 → la cintura está en el piso (medio cuerpo hacia arriba).
+//   head: f=0.25 → el cuello está en el piso (solo cabeza hacia arriba).
+// crop=true escala por altura (recorta los lados); false respeta el ancho.
+const VIEW = {
+  full: { f: 1.00, tw: 0.98, crop: false },
+  half: { f: 0.50, tw: 1.00, crop: true  },
+  head: { f: 0.25, tw: 1.00, crop: true  },
+};
+let modelBounds  = null; // {x,y,width,height} del contenido en px del canvas nativo
+let modelNativeW = 0;
+let modelNativeH = 0;
+let viewMode     = 'random'; // 'full' | 'half' | 'head' | 'random'
+
+function computeContentBounds(model) {
+  try {
+    const im = model.internalModel, core = im && im.coreModel;
+    if (!core || typeof core.getDrawableCount !== 'function') return null;
+    const cw = model.width, ch = model.height;
+    if (!cw || !ch) return null;
+    const cnt = core.getDrawableCount();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let i = 0; i < cnt; i++) {
+      const pos = core.getDrawableVertexPositions(i);
+      const c = core.getDrawableVertexCount(i);
+      if (!pos || !c) continue;
+      for (let j = 0; j < c; j++) {
+        const x = pos[j * 2], y = pos[j * 2 + 1];
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+      }
+    }
+    if (minX === Infinity) return null;
+    const B = {
+      x: (minX + 0.5) * cw,
+      y: ch * (0.5 - maxY * cw / ch),
+      width: (maxX - minX) * cw,
+      height: (maxY - minY) * cw,
+    };
+    // Centro horizontal de la cabeza (banda superior del contenido): las vistas
+    // recortadas (half/head) se centran en él para que la cara no quede cortada.
+    B.headCx = null;
+    const bound = B.y + B.height * 0.35;
+    let hMinX = Infinity, hMaxX = -Infinity;
+    for (let i = 0; i < cnt; i++) {
+      const pos = core.getDrawableVertexPositions(i);
+      const c = core.getDrawableVertexCount(i);
+      if (!pos || !c) continue;
+      for (let j = 0; j < c; j++) {
+        const px = (pos[j * 2] + 0.5) * cw;
+        const py = ch * (0.5 - pos[j * 2 + 1] * cw / ch);
+        if (py <= bound) {
+          if (px < hMinX) hMinX = px;
+          if (px > hMaxX) hMaxX = px;
+        }
+      }
+    }
+    if (hMinX <= hMaxX) B.headCx = (hMinX + hMaxX) / 2;
+    return B;
+  } catch (_) { return null; }
+}
+
+// ── Emociones de voz ──────────────────────────────────────────────────────────
+const EMOTION_PROFILES = {
+  happy:   { rate: '+12%', pitch: '+20Hz' },
+  excited: { rate: '+18%', pitch: '+28Hz' },
+  sad:     { rate: '-10%', pitch: '-8Hz'  },
+  tired:   { rate: '-8%',  pitch: '-4Hz'  },
+  gentle:  { rate: '+2%',  pitch: '+10Hz' },
+  default: { rate: '+8%',  pitch: '+18Hz' },
+};
+
+function detectEmotion(text) {
+  const t = text.toLowerCase();
+  if (/error|fallo|problema|no pude|lo siento|perdon|triste/.test(t)) return 'sad';
+  if (/genial|perfecto|listo|hecho|exito|bien|super|increible/.test(t)) return 'excited';
+  if (/procesando|espera|momento|calculando|buscando/.test(t))          return 'tired';
+  if (/hola|aqui|lista|ayud/.test(t))                                   return 'happy';
+  return 'default';
+}
+
+function cleanForTTS(text) {
+  return text
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FEFF}]/gu, '')
+    .replace(/\s{2,}/g, ' ').trim();
+}
+
+// ── TTS ───────────────────────────────────────────────────────────────────────
+function getAudioCtx() {
+  if (!audioCtx || audioCtx.state === 'closed') audioCtx = new AudioContext();
+  return audioCtx;
+}
+
+async function speak(text, emotionOverride = null) {
+  if (isSpeaking) return;
+  isSpeaking = true;
+
+  const spokenText = cleanForTTS(text);
+  const emotion    = emotionOverride || detectEmotion(spokenText);
+  const emo        = EMOTION_PROFILES[emotion] || EMOTION_PROFILES.default;
+
+  // Gesto acorde al tono de voz que va a decir el asistente.
+  if (gestureEngine && gestureEngine.enabled) gestureEngine.setEmotion(emotion);
+
+  try {
+    const u8 = await ttsStream({
+      voice: TTS_VOICE,
+      rate: emo.rate,
+      pitch: emo.pitch,
+      text: spokenText,
+    });
+    // NO usar WebAudio decodeAudioData: en Chromium 28 el decoder nativo
+    // (AsyncAudioDecoder → AudioBuffer::AudioBuffer(AudioBus*)) crashea con
+    // SEGV ante MP3 inválido/corto (exitCode 139, tumba el renderer). Se
+    // reproduce con HTMLAudioElement + Blob URL (pipeline de media, robusto).
+    const blob = new Blob([u8], { type: 'audio/mpeg' });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    await new Promise((resolve) => { audio.onended = resolve; audio.onerror = resolve; audio.play().catch(resolve); });
+    URL.revokeObjectURL(url);
+  } catch {
+    const utt = new SpeechSynthesisUtterance(spokenText);
+    utt.lang = 'ja-JP'; utt.pitch = 1.3; utt.rate = 1.05;
+    await new Promise(r => { utt.onended = r; speechSynthesis.speak(utt); });
+  }
+
+  isSpeaking = false;
+  triggerMotion();
+}
+
+// ── Live2D ────────────────────────────────────────────────────────────────────
+async function loadModel() {
+  if (!_modelInfo) _modelInfo = await ipcRenderer.invoke('get-model-info').catch(() => null);
+  if (!_modelInfo || !_modelInfo.model3Path) {
+    console.error('Modelo no encontrado:', _modelInfo && _modelInfo.model3Path);
+    return;
+  }
+  if (!(await fs.existsSync(_modelInfo.model3Path))) {
+    console.error('Modelo no encontrado:', _modelInfo.model3Path);
+    return;
+  }
+
+  const parent = canvas.parentElement;
+  const fresh  = document.createElement('canvas');
+  fresh.id = 'live2d-canvas';
+  canvas.replaceWith(fresh);
+  canvas = fresh;
+
+  pixiApp = new PIXI.Application({
+    view: canvas,
+    width:  parent.clientWidth,
+    height: parent.clientHeight,
+    backgroundAlpha: 0,
+    antialias: true,
+    resolution: window.devicePixelRatio || 1,
+    autoDensity: true,
+  });
+
+  PIXI.live2d.Live2DModel.registerTicker(PIXI.Ticker);
+  const fileUrl = 'file:///' + _modelInfo.model3Path.replace(/\\/g, '/');
+
+  try {
+    // Se inyectan expresiones/motions que el model3.json no referencia (ver
+    // core/behavior/ModelAugmenter.js): así el modelo anima de verdad en vez
+    // de quedarse quieto. El settings es un objeto en memoria; no se escribe
+    // nada en disco. Con sandbox:true el augmenter corre en main (IPC).
+    const augmented = await ModelAugmenter.augmentModel(_modelInfo.model3Path);
+    model = await PIXI.live2d.Live2DModel.from(augmented.settings || fileUrl);
+    modelNativeW = model.width;
+    modelNativeH = model.height;
+    modelBounds  = computeContentBounds(model) || { x: 0, y: 0, width: modelNativeW || 1, height: modelNativeH || 1 };
+    pixiApp.stage.addChild(model);
+    applyView(currentView);
+    setupInteraction();
+    startIdle();
+
+    const engine = await initGestureEngine();
+    engine.attach(model, {
+      model3Path: _modelInfo.model3Path,
+      gestures: augmented.gestures,
+      mappings: (gestureConfig || {}).mappings,
+    });
+    engine.startAmbient();
+
+    ipcRenderer.invoke('views-get').then(s => {
+      if (s && s.mode) {
+        viewMode = s.mode;
+        if (viewMode !== 'random') applyView(viewMode, true);
+      }
+    }).catch(() => {});
+    console.log('[overlay] modelo cargado:', _modelInfo.name);
+  } catch(err) {
+    console.error('[overlay] error cargando modelo:', err);
+  }
+}
+
+function reloadModel() {
+  if (gestureEngine) gestureEngine.detach();
+  if (pixiApp) {
+    try { pixiApp.destroy(false, { children: true, texture: true, baseTexture: true }); } catch (e) { console.error('error limpiando modelo:', e); }
+    pixiApp = null; model = null;
+  }
+  loadModel();
+}
+
+// ── Vistas ────────────────────────────────────────────────────────────────────
+function applyView(view, animate = false) {
+  if (!model || !pixiApp) return;
+  if (!VIEW[view]) return;
+  const cfg = VIEW[view];
+  const W   = pixiApp.screen.width;
+  const H   = pixiApp.screen.height;
+  const B   = modelBounds || { x: 0, y: 0, width: modelNativeW || 1, height: modelNativeH || 1 };
+  const cw  = modelNativeW || B.width;
+  const ch  = modelNativeH || B.height;
+  const ts  = cfg.crop
+    ? (H / cfg.f) / B.height
+    : Math.min((W * cfg.tw) / B.width, H / B.height);
+  const S   = ts * B.height;
+  const cx  = (cfg.crop && B.headCx != null ? B.headCx : B.x + B.width / 2) / cw;
+  const ay  = B.y / ch;
+  const tx  = W / 2;
+  const ty  = H - S * cfg.f;
+
+  if (!animate) {
+    model.scale.set(ts);
+    model.anchor.set(cx, ay);
+    model.position.set(tx, ty);
+    currentView = view;
+    return;
+  }
+
+  const dur = 700, start = performance.now();
+  const fs  = model.scale.x, fx = model.x, fy = model.y;
+  const fax = model.anchor.x, fay = model.anchor.y;
+  const ease = t => t < 0.5 ? 2*t*t : -1+(4-2*t)*t;
+
+  const tick = (now) => {
+    const t = Math.min((now - start) / dur, 1);
+    const e = ease(t);
+    model.scale.set(fs + (ts - fs) * e);
+    model.anchor.set(fax + (cx - fax) * e, fay + (ay - fay) * e);
+    model.position.set(fx + (tx - fx) * e, fy + (ty - fy) * e);
+    if (t < 1) requestAnimationFrame(tick);
+    else { currentView = view; triggerMotion(); }
+  };
+  requestAnimationFrame(tick);
+}
+
+function triggerMotion() {
+  try {
+    const defs = model?.internalModel?.motionManager?.definitions;
+    if (!defs || !Array.isArray(defs.Idle) || !defs.Idle.length) return;
+    model.motion('Idle', Math.floor(Math.random() * defs.Idle.length));
+  } catch(_) {}
+}
+
+// ── Idle ──────────────────────────────────────────────────────────────────────
+function startIdle() {
+  setTimeout(triggerMotion, 1000);
+  clearInterval(_idleTimer);
+  _idleTimer = setInterval(triggerMotion, 8000);
+  startAutonomousView();
+}
+
+const VIEW_PERSONALITY = {
+  weights:  { full: 55, half: 25, head: 20 },
+  duration: {
+    full: { min: 35, max: 90 },
+    half: { min: 20, max: 50 },
+    head: { min: 12, max: 30 },
+  },
+};
+
+function pickNextView() {
+  const names = Object.keys(VIEW);
+  const total = names.reduce((s, v) => s + VIEW_PERSONALITY.weights[v], 0);
+  let r = Math.random() * total;
+  for (const v of names) {
+    r -= VIEW_PERSONALITY.weights[v];
+    if (r <= 0) return v;
+  }
+  return names[names.length - 1];
+}
+
+function startAutonomousView() {
+  if (viewMode !== 'random') return;
+  const schedule = () => {
+    const d    = VIEW_PERSONALITY.duration[currentView];
+    const wait = (d.min + Math.random() * (d.max - d.min)) * 1000;
+    setTimeout(() => {
+      if (viewMode !== 'random') { schedule(); return; }
+      const next = pickNextView();
+      if (next && model && next !== currentView) {
+        applyView(next, true);
+        ipcRenderer.send('view-changed', next);
+      }
+      schedule();
+    }, wait);
+  };
+  setTimeout(schedule, 5000);
+}
+
+// ── Interacción: drag + doble click abre chat ─────────────────────────────────
+function setupInteraction() {
+  let clickDownOnModel = false;
+  let lastClickTime    = 0;
+
+  function isOnModel(clientX, clientY) {
+    const rect = pixiApp.view.getBoundingClientRect();
+    const lx = (clientX - rect.left) / pixiApp.renderer.resolution;
+    const ly = (clientY - rect.top)  / pixiApp.renderer.resolution;
+    const b  = model.getBounds();
+    return lx >= b.x && lx <= b.x + b.width && ly >= b.y && ly <= b.y + b.height;
+  }
+
+  pixiApp.view.addEventListener('mousemove', (e) => {
+    if (isDragging) {
+      dragMoved = true;
+      ipcRenderer.send('drag-move', { x: e.screenX, y: e.screenY });
+      return;
+    }
+    const on = isOnModel(e.clientX, e.clientY);
+    ipcRenderer.send('model-hover', on);
+  });
+
+  pixiApp.view.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    if (isOnModel(e.clientX, e.clientY)) {
+      isDragging       = true;
+      dragMoved        = false;
+      clickDownOnModel = true;
+      ipcRenderer.send('drag-start');
+      document.body.style.cursor = 'grabbing';
+    }
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (e.button !== 0) return;
+
+    if (clickDownOnModel && !dragMoved) {
+      const now = Date.now();
+      if (now - lastClickTime < 400) {
+        // Doble click → abrir chat
+        ipcRenderer.send('model-dblclick');
+        lastClickTime = 0;
+      } else {
+        lastClickTime = now;
+        triggerMotion();
+      }
+    }
+
+    isDragging       = false;
+    clickDownOnModel = false;
+    document.body.style.cursor = '';
+    ipcRenderer.send('model-hover', false);
+  });
+
+  pixiApp.view.addEventListener('mouseleave', () => {
+    if (!isDragging) ipcRenderer.send('model-hover', false);
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    ipcRenderer.send('drag-move', { x: e.screenX, y: e.screenY });
+  });
+}
+
+// ── IPC desde main.js ─────────────────────────────────────────────────────────
+ipcRenderer.on('set-view', (e, view) => {
+  if (!VIEW[view]) return;
+  if (!model) { currentView = view; return; }
+  applyView(view, view !== currentView);
+});
+
+ipcRenderer.on('views-changed', (e, s) => {
+  if (!s || !s.mode) return;
+  viewMode = s.mode;
+  if (model && viewMode !== 'random') {
+    applyView(viewMode, viewMode !== currentView);
+  }
+});
+
+ipcRenderer.on('speak', (e, payload) => {
+  if (typeof payload === 'string') speak(payload);
+  else speak(payload.text, payload.emotion || null);
+});
+
+// Gestos disparados desde main.js (iniciativa, propuestas, planes).
+ipcRenderer.on('gesture', (e, payload) => {
+  if (!gestureEngine || !payload || typeof payload.mood !== 'string') return;
+  gestureEngine.play(payload.mood);
+});
+
+// /gestos mapa persistió mappings → aplicarlos en vivo sin recargar.
+ipcRenderer.on('gesture-mappings', (e, mappings) => {
+  if (gestureEngine && mappings && typeof mappings === 'object') {
+    gestureEngine.setMappings(mappings);
+  }
+  if (typeof gestureConfig === 'object' && gestureConfig) {
+    gestureConfig.mappings = { ...(gestureConfig.mappings || {}), ...mappings };
+  }
+});
+
+ipcRenderer.on('model-changed', (e, info) => {
+  if (info && info.model3Path) _modelInfo = info;
+  reloadModel();
+});
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+window.addEventListener('resize', () => {
+  if (!pixiApp || !model) return;
+  pixiApp.renderer.resize(canvas.clientWidth, canvas.clientHeight);
+  applyView(currentView, false);
+});
+
+window.addEventListener('DOMContentLoaded', loadModel);
+</script>
+</body>
+</html>

@@ -1,0 +1,492 @@
+// @ts-nocheck
+const logger = require('../../../observability/Logger.js');
+// gate.js — árbitro central de decisión: gate de contexto determinista
+// (Fase F), filtros baratos (cooldowns, chat abierto, idle, presupuesto) y la
+// consulta al LLM. El LLM produce el mensaje cuando el gate admite la señal.
+
+const LLMProvider = require('../../../llm/LLMProvider.js');
+const {
+  scoreRelevancia,
+  ajustarScorePorAprendizaje,
+} = require('../../../decision/DecisionCore.js');
+const { candidateFromTrigger } = require('../../../decision/SignalNormalizer.js');
+const { evaluate: evaluateGate } = require('../../../decision/ContextGate.js');
+const { buildFocusContext } = require('../ContextAlignment.js');
+
+const {
+  RECENT_CHAT_MS,
+  CONVO_ACTIVE_MIN_TURNS,
+  CONVO_ACTIVE_WINDOW_MS,
+  GLOBAL_MIN_GAP_MS,
+  TRIGGER_COOLDOWN_MS,
+  MAX_IDLE_TO_INTERRUPT,
+  CURIOSITY_TYPES,
+  WORK_SIGNAL_TYPES,
+} = require('../config.js');
+
+const CONTEXTUAL_CONVERSATION_TYPES = new Set([
+  'long_silence',
+  'late_night',
+  'special_date',
+  'return_from_break',
+  'sustained_focus',
+  'focus_block_end',
+  'context_switch_thrash',
+  'session_end',
+  'project_resume',
+  'goal_ready',
+  'session_start',
+  'followup',
+  'media_watching',
+  'clipboard_context',
+  ...CURIOSITY_TYPES,
+]);
+
+// ── Cupo propio de señales de trabajo (espejo del de curiosidad) ────────────
+
+/** ¿Cuántas señales de trabajo (lsp_error…) se enviaron HOY? */
+function _workUsedToday() {
+  if (this._store?.categoryDailyCount) return this._store.categoryDailyCount('work');
+  const day = _localDayString(Date.now());
+  if (this._workDay !== day) return 0;
+  return this._workFired;
+}
+
+/** Registra un envío de señal de trabajo (resetea si cambió el día). */
+function _envelopeWorkFired() {
+  const day = _localDayString(Date.now());
+  if (this._workDay !== day) {
+    this._workDay = day;
+    this._workFired = 0;
+  }
+  this._workFired += 1;
+  this._store?.incrementCategoryDaily?.('work');
+}
+
+function _localDayString(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+    d.getDate()
+  ).padStart(2, '0')}`;
+}
+
+module.exports = {
+  _enqueuePendingTrigger(trigger, reason = 'temporarily_blocked') {
+    if (!trigger || this._autonomyMode === 'observe') return false;
+    const now = Date.now();
+    this._pendingTriggers = (this._pendingTriggers || []).filter(
+      (item) => now - item.queuedAt <= this._pendingTriggerTtlMs
+    );
+    const discriminator =
+      trigger.absPath ||
+      trigger.file ||
+      trigger.nodeId ||
+      String(trigger.context || '').slice(0, 96);
+    const key = `${trigger.type || ''}:${trigger.kind || ''}:${discriminator || ''}`;
+    const existing = this._pendingTriggers.find((item) => item.key === key);
+    const candidate = candidateFromTrigger(trigger);
+    const priority =
+      trigger._gate?.verdict === 'ESCALATE' || trigger.isCritical || candidate?.isCritical
+        ? 100
+        : Math.round((candidate?.score || candidate?.urgencia || 0.5) * 50);
+    if (existing) {
+      existing.trigger = { ...trigger };
+      existing.reason = reason;
+      existing.priority = Math.max(existing.priority, priority);
+      return false;
+    }
+    this._pendingTriggers.push({ key, trigger: { ...trigger }, reason, priority, queuedAt: now });
+    this._pendingTriggers.sort((a, b) => b.priority - a.priority || a.queuedAt - b.queuedAt);
+    const kept = this._pendingTriggers.slice(0, this._pendingTriggerMax);
+    const accepted = kept.some((item) => item.key === key);
+    this._pendingTriggers = kept;
+    return accepted;
+  },
+
+  async _drainPendingTriggers() {
+    if (!this._running || this._deciding || !this._pendingTriggers?.length) return;
+    const now = Date.now();
+    this._pendingTriggers = this._pendingTriggers.filter(
+      (item) => now - item.queuedAt <= this._pendingTriggerTtlMs
+    );
+    this._pendingTriggers.sort((a, b) => b.priority - a.priority || a.queuedAt - b.queuedAt);
+    const item = this._pendingTriggers.shift();
+    if (!item) return;
+    await this._tryTrigger({ ...item.trigger, _fromPending: true });
+  },
+
+  // ── Fase F: gate de contexto (determinista, sin LLM) ──────────────────────
+  // El LLM deja de decidir SI intervenir: este gate (normalizador → score →
+  // contexto → decisión) pone el criterio barato y traceable. El LLM solo
+  // PRODUCE el mensaje cuando el gate admite la señal.
+  //
+  // Devuelve:
+  //   - null            → el trigger no es señal de sensor (temporal/OS de
+  //                       personalidad) → cae al comportamiento anterior.
+  //   - { verdict: 'DROP', ... }    → silencio determinista (ni se consulta LLM).
+  //   - { verdict: 'QUEUE', ... }   → buen candidato, mal momento → se difiere.
+  //   - { verdict: 'ACT'|'ESCALATE', decisionId, score, ... } → el LLM produce.
+  _evaluateTrigger(trigger) {
+    const candidate = candidateFromTrigger(trigger);
+    if (!candidate) return null;
+
+    // Curiosidad: boost de saliencia calculado en GENERACIÓN (contexto de SO
+    // relacionado con el hecho/inferencia), NO en el perfil estático. Se
+    // aplica al vector ANTES de scoreRelevancia para que "justo estás en el
+    // tema" suba la prioridad de preguntar.
+    if (typeof trigger.salienceBoost === 'number' && trigger.salienceBoost > 0) {
+      candidate.signal.salience = Math.max(
+        0,
+        Math.min(1, candidate.signal.salience + trigger.salienceBoost)
+      );
+      candidate.saliencia = candidate.signal.salience;
+    }
+
+    const now = Date.now();
+    const ctx = this._buildGateContext(now);
+    // Fase 3, ítem 2: pesos aprendidos por LearningEngine (feedback
+    // recalibrado). Si los hay, el scoring usa la política ajustada en lugar
+    // de la estática; sin ellos, es identidad.
+    const learnedWeights = this._store?.getLearnedWeights?.() || null;
+    const policyOverride = learnedWeights ? { weights: learnedWeights } : {};
+    const baseScore = scoreRelevancia(candidate.signal, policyOverride);
+    // F-G: aprendizaje por tipo — el historial de aceptación/rechazo que
+    // persiste ProposalStore (por trigger.type) ajusta la relevancia. Sin
+    // muestras suficientes devuelve la R base sin cambios.
+    const typeStats = this._store?.getStats?.()?.byType?.[trigger.type] || null;
+    let score = typeStats ? ajustarScorePorAprendizaje(baseScore, typeStats) : baseScore;
+    const osCtx = this._osSensor?.getCurrentContext?.() ?? {};
+    const focus = buildFocusContext({
+      osContext: osCtx,
+      workspace: this._getWorkspace?.() ?? null,
+      focusedFile: this._getFocusedFile?.() ?? null,
+      eventContext: trigger?.context || '',
+    });
+    this._lastContextFocus = focus;
+    const contextPolicy = this._store?.getContextPolicy?.(focus.mode) || {
+      context: focus.mode,
+      effective: 'balanced',
+      source: 'default',
+    };
+    trigger._proactivityContext = focus.mode;
+    if (contextPolicy.effective === 'engaged' && !candidate.isCritical) {
+      score = Math.min(1, score + 0.08);
+    }
+    candidate.score = score;
+
+    if (
+      contextPolicy.effective === 'quiet' &&
+      CONTEXTUAL_CONVERSATION_TYPES.has(trigger.type) &&
+      !candidate.isCritical
+    ) {
+      const decision = {
+        verdict: 'DROP',
+        reason: 'context_preference_quiet',
+        relevance: score,
+        flow: 'preference',
+      };
+      this._audit.push({
+        sensor: candidate.source.sensor,
+        type: candidate.tipo,
+        kind: candidate.kind,
+        signal: candidate.signal,
+        score,
+        verdict: decision.verdict,
+        reason: decision.reason,
+        contextPreference: contextPolicy,
+        shadow: this._shadowMode,
+        at: now,
+      });
+      return { ...decision, score, candidate, contextPolicy };
+    }
+
+    const result = evaluateGate(candidate, ctx);
+    const auditEntry = {
+      sensor: candidate.source.sensor,
+      type: candidate.tipo,
+      kind: candidate.kind,
+      signal: candidate.signal,
+      score,
+      verdict: result.decision.verdict,
+      reason: result.decision.reason,
+      decisionId: result.decision.decisionId,
+      flow: result.flow,
+      budgetLimit: result.budgetLimit,
+      shadow: this._shadowMode,
+      contextPreference: contextPolicy,
+      at: now,
+    };
+    this._audit.push(auditEntry);
+
+    if (result.queue && !result.admit) {
+      this._queue.push(candidate, { now });
+    }
+
+    return { ...result.decision, score, flow: result.flow, candidate, contextPolicy };
+  },
+
+  _buildGateContext(now) {
+    const osCtx = this._osSensor?.getCurrentContext?.() ?? {};
+    return {
+      now,
+      chatOpen: this._chatOpen,
+      lastUserMsg: this._lastUserMsg || 0,
+      // Ajuste lsp_error: app/categoría enfocada AHORA — el gate decide si el
+      // usuario está en su editor antes de dejar pasar un error de código.
+      osApp: osCtx.app || osCtx.friendlyName || '',
+      osTitle: osCtx.title || '',
+      osCategory: osCtx.category || '',
+      idleSecs: osCtx.idleSecs ?? 0,
+      appElapsedSec: this._categoryStreakStart
+        ? Math.round((now - this._categoryStreakStart) / 1000)
+        : 0,
+      recentSwitches: this._recentSwitches,
+      budgetUsed: this._store?.dailyCount() ?? 0,
+      receptivity: this._receptivity,
+      // Cupo de curiosidad (separado del presupuesto general) — lo consume
+      // ContextGate para los tipos memory_stale/pattern_uncertain/memory_tension.
+      curiosityUsed: this._curiosityUsedToday(),
+      // Cupo de trabajo (lsp_error): propio, igual que la curiosidad.
+      workUsed: this._workUsedToday(),
+      // F-5: tipos degradados por SLO → el gate les sube el umbral de ACT.
+      degradedTypes: this._store ? this._degradedTypes() : undefined,
+    };
+  },
+
+  _degradedTypes() {
+    const { porTipo } = this._sloStats();
+    return new Set(
+      Object.values(porTipo)
+        .filter((t) => t.degraded)
+        .map((t) => t.type)
+    );
+  },
+
+  // Fase 5: ¿conversación ACTIVA? ≥ CONVO_ACTIVE_MIN_TURNS turnos del usuario
+  // dentro de CONVO_ACTIVE_WINDOW_MS. Complementa el RECENT_CHAT_MS fijo: una
+  // conversación real (aunque el usuario pause un rato a pensar) no se
+  // interrumpe. Ventana adaptativa, no un timer de "último mensaje".
+  _isConvoActive(now) {
+    return (
+      Array.isArray(this._recentUserTurns) &&
+      this._recentUserTurns.filter((t) => now - t <= CONVO_ACTIVE_WINDOW_MS).length >=
+        CONVO_ACTIVE_MIN_TURNS
+    );
+  },
+
+  /**
+   * Árbitro central. Devuelve:
+   *   - { blocked: true }  → un pre-filtro lo frenó (chat abierto, cooldown,
+   *                          idle, sin LLM, gap global, lock en curso). El
+   *                          llamador NO debe consumir su oportunidad (racha,
+   *                          cooldown por tipo) y puede reintentar más tarde.
+   *   - null               → el LLM fue consultado y decidió no decir nada.
+   *   - message (string)   → mensaje enviado.
+   */
+  async _tryTrigger(trigger) {
+    if (!this._running) {
+      this._enqueuePendingTrigger(trigger, 'not_running');
+      return { blocked: true };
+    }
+    if (this._autonomyMode === 'observe') return { blocked: true }; // slider: solo observar
+    if (this._deciding) {
+      this._enqueuePendingTrigger(trigger, 'decision_in_progress');
+      return { blocked: true };
+    }
+    if (!LLMProvider.getActiveProvider()) {
+      this._enqueuePendingTrigger(trigger, 'provider_unavailable');
+      return { blocked: true };
+    }
+
+    const now = Date.now();
+
+    // Fase F: el gate decide ANTES del LLM. En shadow mode el gate y el audit
+    // corren, pero nunca se llega a consultar al LLM ni a enviar nada.
+    const gate = this._evaluateTrigger(trigger);
+    if (gate) {
+      if (this._shadowMode) {
+        logger.info(
+          'gate',
+          `[proactive][shadow] gate: ${gate.verdict} (${gate.reason}) score=${gate.score?.toFixed(3)} — sin enviar`
+        );
+        return { blocked: true, shadow: true, gate };
+      }
+      if (gate.verdict === 'DROP' || gate.verdict === 'QUEUE') {
+        logger.info(
+          'gate',
+          `[proactive] gate: ${gate.verdict} (${gate.reason}) score=${gate.score?.toFixed(3)} — ${gate.verdict === 'QUEUE' ? 'diferido' : 'silencio'}`
+        );
+        return { blocked: true, gate };
+      }
+      // ACT / ESCALATE → el LLM produce el mensaje (no decide si intervenir).
+      trigger._gate = gate;
+    }
+
+    // No interrumpir si el usuario está EN MEDIO de una conversación real. El
+    // chat abierto por sí solo NO bloquea: es el canal donde se muestran las
+    // propuestas (ventana principal de la app). Fase 5: además del mínimo fijo
+    // (habló hace < 2 min), se bloquea si la conversación está ACTIVA — ≥ 3
+    // turnos del usuario en los últimos 30 min — aunque haya pausado un rato
+    // a pensar.
+    const chatRecent = !!this._lastUserMsg && now - this._lastUserMsg < RECENT_CHAT_MS;
+    if (chatRecent || this._isConvoActive(now)) {
+      this._enqueuePendingTrigger(trigger, 'conversation_active');
+      return { blocked: true };
+    }
+
+    // ESCALATE (señal crítica con R ≥ escalar): salta los guardas temporales
+    // de no-molestia (gap global, cooldown del tipo y AFK). Un secreto a punto
+    // de commitearse no debería esperar 6 h por la regla de su tipo. Sigue
+    // pasando por el guard de conversación reciente: nunca se interrumpe a
+    // mitad de un intercambio, ni siquiera para algo crítico.
+    const isEscalate = trigger._gate?.verdict === 'ESCALATE';
+    if (!isEscalate) {
+      // Ajusta el gap mínimo según qué tan receptivo esté el usuario
+      const adjustedGap = Math.round(
+        GLOBAL_MIN_GAP_MS * (1 - (this._currentProactiveScore - 0.3) * 0.5)
+      );
+      if (now - this._lastProactive < adjustedGap) {
+        this._enqueuePendingTrigger(trigger, 'global_gap');
+        return { blocked: true };
+      }
+
+      // Cooldown efectivo por tipo — crece si el usuario ha descartado este
+      // tipo varias veces seguidas (Fase A: el rechazo enseña).
+      const baseCooldown =
+        trigger.cooldownOverrideMs || TRIGGER_COOLDOWN_MS[trigger.type] || GLOBAL_MIN_GAP_MS;
+      const cooldown = this._effectiveCooldownMs(trigger.type, baseCooldown);
+      const lastAttempt = this._lastAttemptByType[trigger.type] || 0;
+      if (now - lastAttempt < cooldown) {
+        this._enqueuePendingTrigger(trigger, 'type_cooldown');
+        return { blocked: true };
+      }
+
+      // No interrumpir si lleva mucho AFK — excepto el trigger que ES,
+      // precisamente, "acaba de volver de estar AFK".
+      if (trigger.type !== 'return_from_break') {
+        const idleSecs = this._osSensor?.getCurrentContext()?.idleSecs ?? 0;
+        if (idleSecs > MAX_IDLE_TO_INTERRUPT) {
+          this._enqueuePendingTrigger(trigger, 'user_idle');
+          return { blocked: true };
+        }
+      }
+    }
+
+    // Fase F: el presupuesto diario lo impone el gate dinámico
+    // (ContextGate.evaluate → budgetLimit = dynamicBudget(receptividad)), que
+    // puede subir hasta `DEFAULT_POLICY.budget.max` (20) con buena
+    // receptividad. Aquí ya no hay tope estático duro (DAILY_BUDGET) que lo
+    // anule — el recuento real solo se hace sobre envíos efectivos.
+
+    this._deciding = true;
+    logger.info('gate', `[proactive] trigger: ${trigger.type} — consultando LLM...`);
+
+    try {
+      const message = await this._generateMessage(trigger);
+      if (!this._lastGenerationError) this._lastAttemptByType[trigger.type] = now;
+      if (!message) {
+        logger.info('gate', '[proactive] LLM decidió no enviar mensaje');
+        return null;
+      }
+
+      // La conversación puede haber cambiado mientras respondía el modelo.
+      if (this._lastUserMsg > now || !this._running || this._autonomyMode === 'observe') {
+        return { blocked: true };
+      }
+      this._lastProactive = Date.now();
+      this._lastProactiveMessage = message;
+      this._lastProactiveTrigger = trigger.type;
+
+      // Fase D: historial corto para anti-repetición real (últimos 5).
+      this._recentProactive.push({ msg: message, trigger: trigger.type, at: Date.now() });
+      if (this._recentProactive.length > 5) this._recentProactive.shift();
+
+      // Fase C: un envío real gasta presupuesto del día (solo cuando el LLM
+      // dio el OK — los intentos bloqueados/frustrados no cuentan). La
+      // curiosidad tiene un cupo PROPIO y separado del general: un envío de
+      // memory_stale/pattern_uncertain/memory_tension consume SOLO el cupo de
+      // curiosidad (CURIOSITY_DAILY_CAP), nunca el presupuesto diario normal
+      // (y viceversa).
+      if (CURIOSITY_TYPES.has(trigger.type)) {
+        this._envelopeCuriosityFired();
+      } else if (WORK_SIGNAL_TYPES.has(trigger.type)) {
+        // Señales de trabajo: consumen SOLO su cupo propio, nunca el general.
+        this._envelopeWorkFired();
+      } else if (this._store) {
+        this._store.incrementDaily();
+      }
+
+      const payload = await this._buildPayload(trigger, message);
+      this._store?.recordEmission?.({
+        proposalId: payload.proposalId,
+        type: trigger.type,
+        context: trigger._proactivityContext || this._lastContextFocus?.mode || 'neutral',
+        message,
+        at: Date.now(),
+      });
+
+      // Hilo relacional: registro del mensaje enviado (para bookend y para el
+      // registro adaptativo). El outcome lo rellena handleDecision/el barrido
+      // de ignorados; tope acotado para que no crezca sin límite.
+      this._relationLog.push({
+        proposalId: payload.proposalId || null,
+        trigger: trigger.type,
+        msg: message,
+        at: Date.now(),
+        outcome: null, // pendiente: lo rellena handleDecision / el barrido de ignorados
+      });
+      if (this._relationLog.length > 40) this._relationLog.shift();
+
+      const autonomous = this._prepareAutonomousExecution?.(payload) || null;
+      logger.info('gate', `[proactive] emitiendo: "${message.slice(0, 60)}..."`);
+      this._bus.emit('initiative:trigger', payload);
+
+      if (autonomous && payload.proposalId) {
+        logger.info(
+          'gate',
+          `[proactive] ejecución autónoma autorizada por regla explícita: ${payload.proposal.permissionRule}`
+        );
+        this._executeAutonomousProposal(autonomous, payload.proposalId, trigger.type);
+      }
+
+      // F-5: rastrear la propuesta enviada para marcarla "ignored" si el
+      // usuario no responde en el plazo. El barrido de las vencidas lo hace el
+      // heartbeat (_evaluateTimeBased → _markIgnoredStale) cada 5 min.
+      if (payload.proposalId && !autonomous) {
+        this._sentFeedback.set(payload.proposalId, {
+          type: trigger.type,
+          context: trigger._proactivityContext || this._lastContextFocus?.mode || 'neutral',
+          at: Date.now(),
+        });
+      }
+
+      return message;
+    } finally {
+      this._deciding = false;
+      // Cede el turno antes de intentar la siguiente señal. Si todavía aplica
+      // un cooldown quedará reencolada y el heartbeat la reconsiderará.
+      setTimeout(() => this._drainPendingTriggers(), 0);
+    }
+  },
+
+  /** Factor de cooldown según rechazos consecutivos persistidos del tipo. */
+  _effectiveCooldownMs(type, baseCooldown) {
+    const factor = this._store?.cooldownMultiplier(type) ?? 1;
+    const context = this._lastContextFocus?.mode || 'neutral';
+    const level = this._store?.getContextPolicy?.(context)?.effective || 'balanced';
+    const contextFactor = level === 'engaged' ? 0.75 : level === 'quiet' ? 1.5 : 1;
+    return Math.round(baseCooldown * factor * contextFactor);
+  },
+
+  getCooldownFor(type) {
+    const base = TRIGGER_COOLDOWN_MS[type] ?? GLOBAL_MIN_GAP_MS;
+    return {
+      base,
+      effective: this._effectiveCooldownMs(type, base),
+      factor: this._effectiveCooldownMs(type, base) / base,
+    };
+  },
+
+  _workUsedToday,
+  _envelopeWorkFired,
+};

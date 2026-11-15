@@ -1,0 +1,54 @@
+'use strict';
+
+/**
+ * embedChildProcess.js — proceso hijo standalone para embeddings (recuperación NAPI).
+ *
+ * onnxruntime-node es NAPI single-load: una vez cargado en un proceso, no puede
+ * recargarse (ni en worker_threads nuevos ni en el main thread). Si el worker
+ * principal muere DESPUÉS de haber cargado el modelo, EmbedService fork-ea
+ * este script como child_process.fork() — un proceso OS separado con su propio
+ * espacio de memoria, donde el binding NAPI puede cargarse limpio.
+ *
+ * Protocolo (IPC via process.send / process.on('message')):
+ *   main → child: { id: number, text: string }
+ *   child → main: { type: 'ready' }
+ *   child → main: { type: 'result', id, embedding: number[] }
+ *   child → main: { type: 'error', id, message }
+ *   child → main: { type: 'fatal', message }
+ *
+ * Las peticiones se serializan (una por vez) igual que embedWorker.js.
+ */
+
+(async () => {
+  try {
+    const { pipeline } = await import('@xenova/transformers');
+    const { EMBED_MODEL_ID } = require('./EmbedModel.js');
+    const embedder = await pipeline('feature-extraction', EMBED_MODEL_ID, {
+      progress_callback: undefined,
+    });
+
+    process.send?.({ type: 'ready' });
+
+    let chain = Promise.resolve();
+    process.on('message', (raw) => {
+      const msg =
+        raw && typeof raw === 'object' ? /** @type {{id?:unknown,text?:unknown}} */ (raw) : null;
+      if (!msg || typeof msg.id !== 'number' || typeof msg.text !== 'string') return;
+      chain = chain
+        .then(async () => {
+          const output = await embedder(String(msg.text), { pooling: 'mean', normalize: true });
+          const arr = Array.from(output.data);
+          process.send?.({ type: 'result', id: msg.id, embedding: arr });
+        })
+        .catch((e) => {
+          process.send?.({
+            type: 'error',
+            id: msg.id,
+            message: String(e instanceof Error ? e.message : e),
+          });
+        });
+    });
+  } catch (e) {
+    process.send?.({ type: 'fatal', message: String(e instanceof Error ? e.message : e) });
+  }
+})();

@@ -1,0 +1,580 @@
+// @ts-nocheck
+/* global updateRunOverviewPlan */
+// IPC listeners
+ipcRenderer.on('init-theme', (e, theme) => setTheme(theme));
+ipcRenderer.on('chat-message', (e, text) => processMessage(text));
+ipcRenderer.on('model-changed', (e, info) => {
+  _modelInfo = info && info.model3Path ? info : _modelInfo;
+  _modelNames = ((info && info.models) || []).map((m) => m.name);
+  reloadModel();
+});
+
+ipcRenderer.on('views-changed', (e, s) => {
+  if (!s || !s.mode) return;
+  viewMode = s.mode;
+  if (viewMode !== 'random' && VIEW[viewMode] && model) {
+    applyView(viewMode, viewMode !== currentView);
+  }
+  _refreshViewButtons();
+});
+
+// Clic en los botones de modelo que renderiza /cambio-modelo → carga al instante
+messagesEl.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-model-set]');
+  if (!btn || btn.classList.contains('active')) return;
+  btn.disabled = true;
+  try {
+    const res = await ipcRenderer.invoke('model-set', { id: btn.getAttribute('data-model-set') });
+    if (res.error) {
+      addMessage('assistant', window.kaoruI18n.format('errorChangingModel', { error: res.error }));
+      return;
+    }
+    addMessage('assistant', window.kaoruI18n.format('modelChanged', { name: res.info.name }));
+  } catch (e) {
+    addMessage('assistant', window.kaoruI18n.format('errorChangingModel', { error: e.message }));
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// Clic en los botones de selección de vista que renderiza /modelo-vistas
+messagesEl.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-view-mode]');
+  if (!btn) return;
+  const mode = btn.getAttribute('data-view-mode');
+  const activeBtn = btn.closest('.view-toggle-group');
+  if (activeBtn)
+    activeBtn.querySelectorAll('[data-view-mode]').forEach((b) => {
+      b.disabled = true;
+    });
+  try {
+    const res = await ipcRenderer.invoke('views-set', { mode });
+    if (res.error) {
+      addMessage('assistant', window.kaoruI18n.format('genericError', { error: res.error }));
+      return;
+    }
+    viewMode = res.mode;
+    if (viewMode !== 'random' && VIEW[viewMode] && model)
+      applyView(viewMode, viewMode !== currentView);
+    _refreshViewButtons();
+  } catch (e) {
+    addMessage('assistant', window.kaoruI18n.format('genericError', { error: e.message }));
+  } finally {
+    if (activeBtn)
+      activeBtn.querySelectorAll('[data-view-mode]').forEach((b) => {
+        b.disabled = false;
+      });
+  }
+});
+
+function _refreshViewButtons() {
+  document.querySelectorAll('.view-toggle-group').forEach((group) => {
+    group.querySelectorAll('[data-view-mode]').forEach((b) => {
+      const m = b.getAttribute('data-view-mode');
+      const active = m === viewMode;
+      b.classList.toggle('active', active);
+      b.textContent = `${VIEW_LABELS[m] || m}${active ? ' ✓' : ''}`;
+    });
+  });
+}
+
+// Fase 3
+ipcRenderer.on('openclaw-status', (e, status) => {
+  const { available, sandbox, sandboxReason } = status || {};
+  openclawAvailable = Boolean(available);
+  openclawSandbox = sandbox === undefined || sandbox === null ? null : Boolean(sandbox);
+  openclawSandboxReason = sandboxReason || null;
+  updateSandboxBanner();
+});
+
+// El badge informa el routing interno del flujo único; ya no es un selector.
+function updateUnifiedModeBadge(executionMode = null) {
+  const routed = executionMode === 'fast' || executionMode === 'smart' ? executionMode : null;
+  const badge = document.getElementById('agent-mode-badge');
+  if (badge) {
+    badge.textContent = routed
+      ? `${window.kaoruI18n.t('auto')} ${window.kaoruI18n.t(routed)}`
+      : window.kaoruI18n.t('auto');
+    badge.classList.remove('chat');
+    badge.title = window.kaoruI18n.t('unifiedModeHint');
+  }
+  document.body.dataset.agentMode = 'agent';
+  const composerMode = document.getElementById('composer-mode');
+  if (composerMode) composerMode.textContent = badge?.textContent || window.kaoruI18n.t('auto');
+  if (routed) document.body.dataset.executionMode = routed;
+}
+window.updateUnifiedModeBadge = updateUnifiedModeBadge;
+document.addEventListener('kaoru-language-changed', () =>
+  updateUnifiedModeBadge(document.body.dataset.executionMode)
+);
+onAgentMode(() => updateUnifiedModeBadge());
+
+// Agent Loop IPC (Fase 2 → Cambio 1/2 del rediseño: ActivityBlocks + estados)
+// renderActivityBlock/resetActivityBlocks vienen de chat/activityBlock.js
+// (script hermano, cargado antes que este archivo — ver chat.html).
+// agentStates viene de core/behavior/agentStates.js vía el loader async de
+// core.js (initCoreModules). Los events de agent-progress solo llegan durante
+// un agent-run (muy después de cargar la página), así que el guard es seguro.
+let _activityContainerEl = null;
+
+ipcRenderer.on('agent-progress', (e, progress) => {
+  const state = agentStates ? agentStates.stateFromProgress(progress) : null;
+  if (state)
+    setAgentState(
+      state,
+      progress.status === 'error'
+        ? window.kaoruI18n.t('toolError')
+        : /memory|recall|search_facts/.test(progress.tool || '')
+          ? window.kaoruI18n.t('consultingMemory')
+          : window.kaoruI18n.t('executingTools')
+    );
+  if (chatGestureEngine)
+    chatGestureEngine.onEvent('agent-progress', { state, status: progress.status });
+  if (typeof window.animateAvatarPresence === 'function') {
+    if (progress.phase === 'start') window.animateAvatarPresence('working');
+    else if (progress.phase === 'end' && progress.status === 'error')
+      window.animateAvatarPresence('react');
+    else if (progress.phase === 'end' && progress.status === 'ok')
+      window.animateAvatarPresence('peek');
+  }
+  // Recordar el último archivo escrito para que el frame de preview HTML
+  // muestre su ruta (write/apply_patch llevan el path en params).
+  if (
+    progress.phase === 'end' &&
+    progress.status === 'ok' &&
+    progress.tool &&
+    /^(write|apply_patch)$/i.test(progress.tool)
+  ) {
+    const p = progress.params || {};
+    const path = p.path || p.file_path || p.file || '';
+    if (path) window.__lastWritePath = path;
+  }
+  renderActivityBlock(_activityContainerEl, progress);
+  // Registro navegable de diffs: al terminar OK una mutación de archivo
+  // (write/edit/apply_patch), el meta del server trae el patch unificado y se
+  // inserta un bloque colapsable como registro al que volver después del run.
+  if (
+    progress.phase === 'end' &&
+    progress.status === 'ok' &&
+    progress.meta &&
+    typeof progress.meta.patch === 'string' &&
+    /^(write|edit|edit_file|create_file|apply_patch)$/i.test(progress.tool)
+  ) {
+    renderDiffBlock({
+      path:
+        (progress.params &&
+          (progress.params.path || progress.params.file_path || progress.params.file)) ||
+        '',
+      patch: progress.meta.patch,
+      added: (progress.meta.addedLines || []).length,
+      removed: (progress.meta.removedLines || []).length,
+    });
+  }
+  // Bloque de subagente (F4): la tool subagent del loop padre abre/cierra el
+  // bloque colapsable del perfil; el detalle lo llena 'agent-subagent-progress'
+  // (ver listener abajo) mientras el subagente trabaja.
+  if (progress.tool === 'subagent' || progress.tool === 'task') {
+    const agent = (progress.params && progress.params.agent) || 'general';
+    if (progress.phase === 'start') openSubagentRun(agent);
+    else if (progress.phase === 'end') finalizeSubagentRun(agent, progress);
+  }
+  // Cierre del segmento de streaming: cuando una iteración terminó en un
+  // tool-call (phase 'start' del tool), la narración que el LLM streamió en
+  // esa iteración se pliega en un bloque "razonando" y el buffer del bubble se
+  // limpia — así la respuesta final queda como único mensaje. Se llama DESPUÉS
+  // de renderActivityBlock para que el bloque quede justo encima del tool.
+  if (progress.phase === 'start') closeStreamSegment();
+});
+
+// Progreso interno de un subagente (perfil): el run anidado reporta sus
+// fases por este canal (re-emitidas desde el loop padre con el nombre del
+// perfil) y se pintan como líneas dentro del bloque subagent abierto.
+ipcRenderer.on('agent-subagent-progress', (e, payload) => {
+  renderSubagentBlock(payload);
+});
+
+// HUD del plan explícito (plan-then-act): AgentLoop reenvía por 'agent-plan'
+// los pasos del plan y el conteo completado; se pintan como widget en el feed.
+ipcRenderer.on('agent-plan', (e, plan) => {
+  renderPlanBlock(plan);
+  updateRunOverviewPlan(plan);
+});
+
+function setActivityContainer(el) {
+  _activityContainerEl = el;
+}
+
+ipcRenderer.on(
+  'agent-approval-needed',
+  (e, { actionId, tool, params, description, diff, allowAlways }) => {
+    _showApprovalCard({ id: actionId, tool, params, description, diff, allowAlways });
+  }
+);
+
+// El timeout de aprobación expiró en main (sin respuesta del usuario): el card
+// se marca como expirado en vez de quedar activo aceptando clics que no van a
+// ningún lado. La acción NO se ejecutó.
+ipcRenderer.on('agent-approval-expired', (e, { actionId }) => {
+  _expireApprovalCard(actionId);
+});
+ipcRenderer.on('agent-approval-cancelled', (e, { actionId }) => {
+  _cancelApprovalCard(actionId);
+});
+
+// Gestos espontáneos difundidos desde main (generación, tareas agénticas,
+// proactividad, errores LSP…): el mini-avatar reacciona igual que el overlay.
+ipcRenderer.on('gesture', (e, payload = {}) => {
+  if (!payload || typeof payload.mood !== 'string') return;
+  if (payload.source === 'terminal' && typeof window.reactTerminalAvatar === 'function') {
+    window.reactTerminalAvatar(payload.mood);
+  } else if (typeof window.animateAvatarPresence === 'function') {
+    window.animateAvatarPresence(payload.mood === 'happy' ? 'celebrate' : 'react');
+  }
+  if (
+    payload.source === 'terminal' &&
+    (document.getElementById('app').dataset.terminalMotion === 'off' ||
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+  )
+    return;
+  if (chatGestureEngine) {
+    chatGestureEngine.play(payload.mood);
+    return;
+  }
+  // Motor aún no inicializado: inicializarlo lazy y reproducir.
+  import('./core.js')
+    .then((m) => m.initGestureEngine())
+    .then((eng) => eng.play(payload.mood))
+    .catch(() => {});
+});
+
+// Chips de resultado del run agéntico: skills usadas + verificación de
+// artefactos. Se encolan acá y process.js las pinta bajo la burbuja cuando
+// termina el revelado del texto.
+let _resultMeta = null;
+ipcRenderer.on('agent-result-meta', (e, meta = {}) => {
+  _resultMeta = meta && (meta.skills?.length || meta.artifactRounds || meta.verified) ? meta : null;
+});
+function _takeResultMeta() {
+  const m = _resultMeta;
+  _resultMeta = null;
+  return m;
+}
+function _renderResultChips(meta) {
+  if (!meta) return;
+  const chips = [];
+  for (const s of meta.skills || []) chips.push(`⚡ ${s}`);
+  if (meta.verified === 'passed') chips.push('✓ verificado');
+  if (meta.artifactRounds > 0) chips.push(`auto-corregido (${meta.artifactRounds})`);
+  if (meta.verified === 'unverified') chips.push('⚠ sin verificar');
+  if (!chips.length) return;
+  try {
+    const row = document.createElement('div');
+    row.className = 'result-chips';
+    row.innerHTML = chips.map((c) => `<span class="chip">${c}</span>`).join('');
+    messagesEl.appendChild(row);
+    _scrollMessagesToBottom();
+  } catch (_) {}
+}
+
+// Validación temprana de config.json: issues como CARD con acción (solo
+// visual — NO entra al sessionHistory que consume el LLM).
+function startupNoticeText(payload) {
+  if (payload.type === 'workspace_busy') return window.kaoruI18n.t('workspaceBusy');
+  if (payload.type === 'no_keys') return window.kaoruI18n.t('configNoKeys');
+  if (payload.type === 'missing') {
+    const values = { path: payload.path || '' };
+    return [
+      window.kaoruI18n.format('configMissing', values),
+      payload.example
+        ? window.kaoruI18n.format('configCopyExample', { ...values, example: payload.example })
+        : '',
+      window.kaoruI18n.t('configRestartAfterKey'),
+    ]
+      .filter(Boolean)
+      .join(' ');
+  }
+  if (payload.type === 'invalid_json') {
+    if (Number.isInteger(payload.line))
+      return window.kaoruI18n.format('configInvalidJson', {
+        line: payload.line,
+        column: payload.column,
+        reason: payload.reason || '',
+      });
+    return window.kaoruI18n.format('configUnreadable', { reason: payload.reason || '' });
+  }
+  return payload.message;
+}
+const startupNoticePayloads = new WeakMap();
+ipcRenderer.on('startup-notice', (e, payload = {}) => {
+  if (!payload || typeof payload.message !== 'string' || !payload.message.trim()) return;
+  try {
+    const isNoKeys = payload.type === 'no_keys' || /selector de modelos/.test(payload.message);
+    const wrap = document.createElement('div');
+    wrap.className = 'startup-card';
+    startupNoticePayloads.set(wrap, payload);
+    const close = document.createElement('button');
+    close.className = 'startup-card-close';
+    close.textContent = '×';
+    close.title = window.kaoruI18n.t('dismiss');
+    close.addEventListener('click', () => {
+      // Salida animada: fade + slide antes de remover (respeta reduced-motion
+      // porque .closing sin transition en esa media query es instantáneo).
+      wrap.classList.add('closing');
+      setTimeout(() => wrap.remove(), 180);
+    });
+    const body = document.createElement('div');
+    body.className = 'startup-card-body';
+    body.innerHTML = renderMarkdown(
+      `**[${window.kaoruI18n.t('configuration')}]** ${startupNoticeText(payload)}`
+    );
+    body.querySelectorAll('.mermaid').forEach((el) => _renderMermaid(el));
+    wrap.appendChild(body);
+    if (isNoKeys) {
+      const actions = document.createElement('div');
+      actions.className = 'startup-card-actions';
+      const openPicker = document.createElement('button');
+      openPicker.textContent = window.kaoruI18n.t('openModelPicker');
+      openPicker.addEventListener('click', () => {
+        wrap.remove();
+        processMessage('/model');
+      });
+      actions.appendChild(openPicker);
+      wrap.appendChild(actions);
+    }
+    wrap.appendChild(close);
+    messagesEl.appendChild(wrap);
+    _scrollMessagesToBottom();
+  } catch (_) {
+    /* la UI nunca debe romperse por un aviso */
+  }
+});
+document.addEventListener('kaoru-language-changed', () => {
+  for (const wrap of document.querySelectorAll('.startup-card')) {
+    const payload = startupNoticePayloads.get(wrap);
+    if (!payload) continue;
+    wrap.querySelector('.startup-card-body').innerHTML = renderMarkdown(
+      `**[${window.kaoruI18n.t('configuration')}]** ${startupNoticeText(payload)}`
+    );
+    wrap.querySelector('.startup-card-close').title = window.kaoruI18n.t('dismiss');
+    const picker = wrap.querySelector('.startup-card-actions button');
+    if (picker) picker.textContent = window.kaoruI18n.t('openModelPicker');
+  }
+});
+
+// /gestos mapa persistió mappings → aplicarlos en vivo en el mini-avatar.
+ipcRenderer.on('gesture-mappings', (e, mappings) => {
+  if (!mappings || typeof mappings !== 'object') return;
+  if (chatGestureConfig) {
+    chatGestureConfig.mappings = { ...(chatGestureConfig.mappings || {}), ...mappings };
+  }
+  if (chatGestureEngine) chatGestureEngine.setMappings(mappings);
+});
+
+ipcRenderer.on('initiative', (e, payload) => {
+  if (!payload || typeof payload.suggestion !== 'string' || !payload.suggestion) return;
+  if (chatGestureEngine) chatGestureEngine.onEvent('initiative');
+  (async () => {
+    const { bubble } = addMessage('assistant', '');
+    const badge = document.createElement('span');
+    badge.style.cssText =
+      'display:inline-block;font-family:var(--font-mono);font-size:9px;color:var(--accent);border:1px solid var(--border-accent);border-radius:3px;padding:1px 5px;margin-right:6px;opacity:.7;vertical-align:middle;';
+    badge.textContent = 'AP';
+    bubble.classList.add('markdown');
+    bubble.appendChild(badge);
+    const textSpan = document.createElement('span');
+    bubble.appendChild(textSpan);
+    // Revelar el texto renderizando markdown en vivo (limpio mientras se
+    // escribe, con cursor parpadeante); al terminar ya queda renderizado.
+    const parsedIni = _parseGestureMarkers(payload.suggestion);
+    const reveal = revealText(textSpan, parsedIni.clean, {
+      markdown: true,
+      gestures: parsedIni.markers,
+      onGesture: _playGesture,
+    });
+    await reveal.done;
+    bubble.querySelectorAll('.mermaid').forEach((el) => _renderMermaid(el));
+    _scrollMessagesToBottom();
+    speak(parsedIni.clean);
+    pushToSession('assistant', parsedIni.clean);
+    ipcRenderer.send('memory-add-turn', { role: 'assistant', content: parsedIni.clean });
+
+    // Fase A: si la iniciativa trae una propuesta, se muestran botones de
+    // consentimiento. El voto es feedback para ajustar la frecuencia futura;
+    // la ejecución de la acción declarada llega en la Fase B.
+    if (payload.proposal) {
+      _renderProposal(payload.proposal, bubble);
+    }
+  })();
+});
+
+// Propuestas proactivas (Fase A)
+// proposalId → wrap (div .proposal-actions) para poder confirmar el resultado
+// real de la ejecución (Fase B) en el bubble correcto.
+const _proposalActions = new Map();
+
+function _renderProposal(proposal, bubble) {
+  const wrap = document.createElement('div');
+  wrap.className = 'proposal-actions';
+  const isQuestion = proposal.kind === 'question';
+  const isAction = Boolean(proposal.action);
+  wrap.classList.add(isAction ? 'proposal-executable' : 'proposal-conversation');
+
+  if (proposal.preview) {
+    const preview = document.createElement('div');
+    preview.className = 'proposal-preview';
+    preview.textContent = proposal.preview;
+    wrap.appendChild(preview);
+  }
+
+  if (proposal.diff) {
+    const diff = document.createElement('pre');
+    diff.className = 'proposal-diff';
+    diff.textContent = proposal.diff;
+    wrap.appendChild(diff);
+  }
+
+  const btns = document.createElement('div');
+  btns.className = 'proposal-btns';
+
+  const accept = document.createElement('button');
+  accept.className = 'btn-proposal-accept';
+  accept.textContent = isAction
+    ? proposal.title || window.kaoruI18n.t('runAction')
+    : isQuestion
+      ? window.kaoruI18n.t('reply')
+      : window.kaoruI18n.t('discussThis');
+  accept.addEventListener('click', () => {
+    sendProposalDecision(proposal, isAction ? 'accepted' : 'respond', wrap, accept);
+    if (!isAction) document.getElementById('msg-input')?.focus();
+  });
+
+  const deny = document.createElement('button');
+  deny.className = 'btn-proposal-deny';
+  deny.textContent = window.kaoruI18n.t(isAction ? 'doNotRun' : 'notNow');
+  deny.addEventListener('click', () =>
+    sendProposalDecision(proposal, isAction ? 'rejected' : 'deferred', wrap, deny)
+  );
+
+  btns.appendChild(accept);
+  btns.appendChild(deny);
+  if (proposal.type === 'knowledge_gap') {
+    const never = document.createElement('button');
+    never.className = 'btn-proposal-deny';
+    never.textContent = window.kaoruI18n.t('doNotAskThis');
+    never.addEventListener('click', () => sendProposalDecision(proposal, 'never', wrap, never));
+    btns.appendChild(never);
+  }
+  wrap.appendChild(btns);
+  bubble.appendChild(wrap);
+
+  _proposalActions.set(proposal.id, wrap);
+  if (_proposalActions.size > 50) {
+    const oldest = _proposalActions.keys().next().value;
+    _proposalActions.delete(oldest);
+  }
+  _scrollMessagesToBottom();
+}
+
+function sendProposalDecision(proposal, decision, wrap, clickedBtn) {
+  ipcRenderer.send('initiative-decision', {
+    proposalId: proposal.id,
+    type: proposal.type,
+    decision,
+  });
+
+  wrap.querySelectorAll('button').forEach((b) => {
+    b.disabled = true;
+  });
+  clickedBtn.classList.remove('btn-proposal-accept', 'btn-proposal-deny');
+  if (decision === 'accepted') {
+    clickedBtn.classList.add('btn-proposal-accept');
+    clickedBtn.style.opacity = '1';
+  }
+
+  const status = document.createElement('span');
+  status.className = decision === 'accepted' ? 'proposal-status ok' : 'proposal-status no';
+  const statusKey = {
+    accepted: 'proposalAccepted',
+    rejected: 'proposalRejected',
+    respond: 'proposalRespond',
+    deferred: 'proposalDeferred',
+    never: 'proposalNever',
+  }[decision];
+  status.textContent = statusKey ? window.kaoruI18n.t(statusKey) : '';
+  wrap.appendChild(status);
+  _scrollMessagesToBottom();
+}
+
+// Fase B: resultado real de la ejecución de una propuesta aceptada — la
+// confirmación llega con la verificación REAL (p. ej. git check-ignore), no
+// de oído.
+ipcRenderer.on('proposal-result', (e, { proposalId, ok, skipped, detail }) => {
+  if (chatGestureEngine) chatGestureEngine.onEvent('proposal-result', { ok });
+  const wrap = _proposalActions.get(proposalId);
+  if (!wrap) return;
+  _proposalActions.delete(proposalId);
+
+  const prev = wrap.querySelector('.proposal-status');
+  if (prev) prev.remove();
+
+  const status = document.createElement('span');
+  status.className = ok ? 'proposal-status ok' : 'proposal-status err';
+  status.textContent = skipped
+    ? `↺ ${detail || window.kaoruI18n.t('alreadyDone')}`
+    : ok
+      ? `✓ ${detail || window.kaoruI18n.t('doneShort')}`
+      : `✗ ${detail || window.kaoruI18n.t('somethingFailed')}`;
+  wrap.appendChild(status);
+  _scrollMessagesToBottom();
+});
+
+// Init
+window.addEventListener('DOMContentLoaded', loadModel);
+setActivityContainer(document.getElementById('messages'));
+
+// ── Roundtrip main → página (sandbox:true) ─────────────────────────────────
+// El main construye el ctx de CommandRegistry con stubs de funciones de página
+// (ver ipc/chat-handlers.js). Cada stub envía un chat-ui-call; aquí se ejecuta
+// la función real del renderer y se responde con chat-ui-call-result. Las
+// funciones NO viajan por el bridge: solo nombres, y los argumentos son datos
+// serializables.
+assistant.onUiCall(({ id, fn, args }) => {
+  Promise.resolve()
+    .then(() => {
+      switch (fn) {
+        case 'addMessage':
+          return addMessage(...(args || []));
+        case 'processMessage':
+          return processMessage(...(args || []));
+        case 'openSettings':
+          return openSettings();
+        case 'openSessions':
+          return openSessions();
+        case 'openNodes':
+          return openNodes();
+        case 'hideNodes':
+          return hideNodes();
+        case 'openPerms':
+          return openPermsModal();
+        case 'pickWorkspace':
+          return ipcRenderer.invoke('pick-workspace-folder');
+        case 'gesture-play':
+          if (!chatGestureEngine) return { ok: false, reason: 'sin motor de gestos' };
+          return chatGestureEngine.play(args[0], args[1] || {});
+        case 'setTtsMuted':
+          return setTtsMuted(args[0]);
+        case 'ipc-invoke':
+          return ipcRenderer.invoke(...(args || []));
+        case 'ipc-send':
+          return ipcRenderer.send(...(args || []));
+        default:
+          throw new Error('ui-call desconocido: ' + fn);
+      }
+    })
+    .then((result) => assistant.uiCallResult(id, result === undefined ? null : result))
+    .catch((err) => assistant.uiCallResult(id, { __error: (err && err.message) || String(err) }));
+});
+
+// ── Auto-update eliminado ───────────────────────────────────────────────────
+// Las versiones nuevas se publican como instaladores en GitHub; este build no
+// consulta, descarga ni instala actualizaciones por su cuenta.

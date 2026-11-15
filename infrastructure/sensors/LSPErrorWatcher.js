@@ -1,0 +1,458 @@
+// @ts-nocheck
+'use strict';
+const logger = require('../../core/observability/Logger.js');
+
+/**
+ * LSPErrorWatcher.js — Fase D: errores del LSP como señal proactiva.
+ *
+ * Vigila los diagnósticos del LSP en el workspace activo y emite `lsp:error`
+ * cuando aparece un error real de código (severidad 1 = Error). Es la pieza
+ * que convierte el LSP en un SENSOR del camino proactivo: el asistente no espera a
+ * que el usuario le pida — si hay un error de código en el archivo que estás
+ * tocando, lo nota y (con permiso) ofrece un parche.
+ *
+ * Reglas de diseño (mismas que GitWatcher/SystemWatcher):
+ *   - Silencio total sin workspace o sin LSP: no emite, no tira errores.
+ *   - Umbral por severidad: SOLO errores (1). Los warnings se ignoran por
+ *     diseño (falsos positivos de linting no son señales — ROADMAP #17).
+ *   - Emisión por flanco: dedup por archivo (hash de los errores), se re-emite
+ *     solo cuando cambia el conjunto de errores. El cooldown por tipo del
+ *     ProactiveEngine es el segundo freno.
+ *   - Scope por workspace: jamás diagnostica archivos fuera de `getWorkspace()`
+ *     y el payload siempre lleva `workspace` (ROADMAP #21).
+ *   - Nunca lanza: cada scan está aislado; errores del LSP solo se loguean.
+ *   - Editor tracker: mantiene el set de archivos "abiertos en el editor"
+ *     (el enfocado detectado por el título de la ventana + inyección opcional),
+ *     que el ProactiveExecutor usa para NO escribir sobre archivos abiertos.
+ *
+ * Todo inyectable para tests: `lsp`, `getWorkspace`, `getCurrentTitle`,
+ * `getSymbols`, `listFiles`, `getDiagnostics`.
+ */
+
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+const { dirSet } = require('../../core/utils/ignoreDirs.js');
+
+const { getEventBus } = require('../../infrastructure/event-bus/EventBus.js');
+const { BasePollingWatcher } = require('./BasePollingWatcher.js');
+
+const DEFAULT_POLL_MS = 30 * 1000;
+const DEFAULT_MAX_SCAN = 6; // archivos diagnosticados por poll
+const DEFAULT_MAX_INDEXED = 3000; // límite del índice de archivos del workspace
+const SEVERITY_ERROR = 1;
+const INDEX_TTL_MS = 30 * 1000;
+
+// Carpetas/globals que jamás se indexan (ruido o no-code).
+const IGNORED_DIRS = dirSet([
+  '.git',
+  'out',
+  'coverage',
+  'vendor',
+  'target',
+  '.nuxt',
+  '.venv',
+  'venv',
+]);
+
+async function _defaultListFiles(ws, max = DEFAULT_MAX_INDEXED) {
+  const results = [];
+  const walk = async (dir, depth) => {
+    if (results.length >= max) return;
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (results.length >= max) return;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (IGNORED_DIRS.has(e.name) || depth >= 8) continue;
+        await walk(full, depth + 1);
+      } else if (e.isFile()) {
+        results.push(full);
+      }
+    }
+  };
+  await walk(ws, 0);
+  return results;
+}
+
+function _normalizeError(d) {
+  return {
+    code: d.code || null,
+    message: (d.message || '').trim(),
+    line: d.range?.start?.line ?? 0,
+    character: d.range?.start?.character ?? 0,
+    severity: d.severity ?? 1,
+    source: d.source || null,
+  };
+}
+
+function _hashErrors(errors) {
+  return crypto.createHash('sha1').update(JSON.stringify(errors)).digest('hex');
+}
+
+class LSPErrorWatcher extends BasePollingWatcher {
+  constructor({
+    lsp = null,
+    getWorkspace = () => null,
+    getCurrentTitle = () => '',
+    getSymbols = null,
+    getDiagnostics = null,
+    listFiles = null,
+    supportedExts = ['.ts', '.tsx', '.js', '.jsx', '.mjs'],
+    pollMs = DEFAULT_POLL_MS,
+    maxScanPerPoll = DEFAULT_MAX_SCAN,
+    severityThreshold = SEVERITY_ERROR,
+    bus = getEventBus(),
+    extraOpenFiles = null, // () => string[] — archivos abiertos en el editor (inyección)
+  } = {}) {
+    super({ pollMs, bus });
+    this._lsp = lsp;
+    this._getWorkspace = getWorkspace || (() => null);
+    this._getCurrentTitle = getCurrentTitle || (() => '');
+    this._getSymbols = getSymbols || null;
+    this._getDiagnostics =
+      getDiagnostics || ((abs) => this._lsp?.getDiagnostics?.(abs) || Promise.resolve([]));
+    this._listFiles = listFiles || ((ws) => _defaultListFiles(ws, DEFAULT_MAX_INDEXED));
+    this._supportedExts = supportedExts;
+    this._maxScanPerPoll = maxScanPerPoll;
+    this._severityThreshold = severityThreshold;
+    this._extraOpenFiles = extraOpenFiles || null;
+
+    this._workspace = null;
+    this._filesIndex = []; // lista cacheada de archivos soportados
+    this._filesIndexAt = 0;
+
+    this._openInEditor = new Set(); // absPath → archivos que el editor tiene abiertos
+    this._focusedFile = null; // absPath del archivo actualmente enfocado
+    this._signals = new Map(); // absPath → hash del último error emitido
+    this._lastErrors = new Map(); // absPath → errores del último scan
+    this._emitted = 0;
+    // P4: debounce del scan reactivo + handler de os:app-changed.
+    this._lastForcedScan = 0;
+    this._scanCursor = 0;
+    this._appChangedHandler = null;
+  }
+
+  /** Arranca el poll + suscripción reactiva al cambio de app/foco. */
+  start() {
+    if (this._running) return;
+    super.start();
+    if (!this._appChangedHandler) {
+      this._appChangedHandler = () => this.scanNow();
+      this._bus.on('os:app-changed', this._appChangedHandler);
+    }
+  }
+
+  stop() {
+    if (this._appChangedHandler) {
+      try {
+        this._bus.off('os:app-changed', this._appChangedHandler);
+      } catch {}
+      this._appChangedHandler = null;
+    }
+    super.stop();
+  }
+
+  /**
+   * Fase D: cambia de workspace (scope). Reset del estado previo — jamás se
+   * mezclan errores/archivos abiertos entre proyectos (ROADMAP #21).
+   */
+  resetWorkspace(ws) {
+    this._workspace = ws || null;
+    this._filesIndex = [];
+    this._filesIndexAt = 0;
+    this._openInEditor.clear();
+    this._focusedFile = null;
+    this._signals.clear();
+    this._lastErrors.clear();
+    this._scanCursor = 0;
+  }
+
+  // ── Escaneo ──────────────────────────────────────────────────────────────
+
+  async _scan() {
+    const ws = this._getWorkspace();
+    if (!ws) return;
+    this._workspace = ws;
+
+    const focused = await this._detectFocusedFile(ws);
+    if (focused && focused !== this._focusedFile) {
+      this._focusedFile = focused;
+      this._openInEditor.add(focused);
+      if (this._lsp?.openDocument) {
+        try {
+          await this._lsp.openDocument(focused);
+        } catch (e) {
+          /* no rompe */
+        }
+      }
+    }
+
+    const candidates = await this._buildCandidates(ws, focused);
+    for (const abs of candidates) {
+      let diagnostics;
+      try {
+        diagnostics = await this._getDiagnostics(abs);
+      } catch (e) {
+        if (process.env.DEBUG)
+          logger.warn(
+            'LSPErrorWatcher',
+            `[lsp-watcher] diagnóstico ${path.basename(abs)}:`,
+            e.message
+          );
+        continue;
+      }
+      if (this._pollController?.signal.aborted) return;
+      const errors = (Array.isArray(diagnostics) ? diagnostics : [])
+        .filter((d) => (d.severity ?? SEVERITY_ERROR) === this._severityThreshold)
+        .map(_normalizeError)
+        .filter((e) => e.message);
+
+      this._lastErrors.set(abs, errors);
+
+      const hash = _hashErrors(errors);
+      if (hash === this._signals.get(abs)) continue;
+      this._signals.set(abs, hash);
+      if (!errors.length) continue;
+
+      // Nuevo conjunto de errores → señal. Los símbolos se piden solo para el
+      // archivo enfocado (o el primero), para no multiplicar requests al LSP.
+      const rel = path.relative(ws, abs);
+      let symbols = null;
+      if (this._getSymbols && (abs === focused || abs === candidates[0])) {
+        try {
+          symbols = await this._getSymbols(abs);
+        } catch (e) {
+          logger.warn(
+            'LSPErrorWatcher',
+            '[lsp] falló al obtener símbolos:',
+            e && e.message ? e.message : e
+          );
+        }
+      }
+      this._emitted += 1;
+      this._bus.emit('lsp:error', {
+        file: rel.split(path.sep).join('/'),
+        absPath: abs,
+        workspace: ws,
+        errors,
+        count: errors.length,
+        focused: abs === focused,
+        symbols,
+        // Lenguaje del archivo (el LLM debe parchear en el idioma correcto):
+        // los errores llegan "en TS" (checkJs), pero el archivo es el que es.
+        languageId: this._languageFor(abs),
+        fileType: path.extname(abs).toLowerCase(),
+      });
+    }
+  }
+
+  async _detectFocusedFile(ws) {
+    const title = this._getCurrentTitle() || '';
+    const base = this._basenameFromTitle(title);
+    if (!base) return null;
+
+    const files = await this._filesFor(ws);
+    const matches = files.filter((f) => path.basename(f) === base);
+    // Solo confiar en el foco si el nombre del archivo es inequívoco.
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  _basenameFromTitle(title) {
+    // "foo.ts — Proyecto — Visual Studio Code" / "foo.ts - Proyecto"
+    const first = title.split(/\s+[—–-]\s+/)[0].trim();
+    if (!first || first.includes(' ')) {
+      // Puede ser una ruta ("/a/b/foo.ts") o un nombre compuesto; tomamos la
+      // última parte con extensión soportada si el título parece un path.
+      const segs = first.split(/[\\/]/);
+      const last = segs[segs.length - 1];
+      return last && this._isSupported(last) ? last : null;
+    }
+    return this._isSupported(first) ? first : null;
+  }
+
+  // Lenguaje del archivo para el payload de la señal. Primero se consulta el
+  // mapa dinámico ext→languageId derivado de los servidores LSP ACTIVOS
+  // (servers.json): así un .py se reporta como 'python' cuando pyright corre,
+  // en vez de caer al fallback TS/JS hardcodeado.
+  _languageFor(abs) {
+    const dynamic = this._activeExtMap();
+    if (dynamic.size) {
+      const lang = dynamic.get(path.extname(abs).toLowerCase());
+      if (lang) return lang;
+    }
+    const ext = path.extname(abs).toLowerCase();
+    if (ext === '.ts' || ext === '.tsx' || ext === '.mts' || ext === '.cts') return 'typescript';
+    if (ext === '.js' || ext === '.jsx' || ext === '.mjs' || ext === '.cjs') return 'javascript';
+    if (this._lsp?._serverConfig?.languageId) return this._lsp._serverConfig.languageId;
+    return 'plaintext';
+  }
+
+  /**
+   * Mapa ext→languageId construido desde los servidores LSP activos del
+   * workspace. Vacío si no hay instancias corriendo (el caller decide el
+   * fallback). Evita el hardcodeo JS/TS que excluía a Python/Go/etc.
+   * @returns {Map<string, string>}
+   */
+  _activeExtMap() {
+    if (this._extMapAt && Date.now() - this._extMapAt < INDEX_TTL_MS && this._extMap) {
+      return this._extMap;
+    }
+    const map = new Map();
+    try {
+      for (const inst of this._lsp?._instances?.values() || []) {
+        // Solo servidores realmente corriendo: diagnosticar contra una
+        // instancia zombie cuesta un timeout de pull por archivo.
+        if (!inst?.isRunning) continue;
+        const cfg = inst._serverConfig;
+        if (!cfg) continue;
+        for (const pat of cfg.filePatterns || [])
+          map.set(String(pat).toLowerCase(), cfg.languageId);
+      }
+    } catch (_) {
+      /* nunca romper el scan por esto */
+    }
+    this._extMap = map;
+    this._extMapAt = Date.now();
+    return map;
+  }
+
+  async _filesFor(ws) {
+    if (
+      this._filesIndexAt &&
+      Date.now() - this._filesIndexAt < INDEX_TTL_MS &&
+      this._workspace === ws
+    ) {
+      return this._filesIndex;
+    }
+    const all = (await this._listFiles(ws)) || [];
+    this._filesIndex = all.filter((f) => this._isSupported(path.basename(f)));
+    this._filesIndexAt = Date.now();
+    return this._filesIndex;
+  }
+
+  async _buildCandidates(ws, focused) {
+    const files = await this._filesFor(ws);
+    const withOld = this._signals.size
+      ? Array.from(this._signals.keys()).filter((f) => f.startsWith(ws))
+      : [];
+    const seen = new Set();
+    const ordered = [];
+
+    const push = (p) => {
+      if (!p || seen.has(p)) return;
+      seen.add(p);
+      if (ordered.length < this._maxScanPerPoll) ordered.push(p);
+    };
+
+    // 1) El archivo enfocado (lo que el usuario está viendo ahora).
+    push(focused);
+    // 2) Archivos con errores ya vistos (re-visitar para detectar el fix).
+    for (const f of withOld) push(f);
+    // 3) Ventana rotativa del índice. Antes siempre se recorría desde cero y
+    // los archivos posteriores al sexto podían no diagnosticarse jamás.
+    if (files.length > 0) {
+      for (let offset = 0; offset < files.length; offset++) {
+        push(files[(this._scanCursor + offset) % files.length]);
+        if (ordered.length >= this._maxScanPerPoll) break;
+      }
+      this._scanCursor = (this._scanCursor + Math.max(1, this._maxScanPerPoll)) % files.length;
+    }
+    return ordered;
+  }
+
+  _isSupported(base) {
+    const ext = path.extname(base).toLowerCase();
+    // Prioridad: extensiones de servidores LSP ACTIVOS (multi-lenguaje real).
+    const active = this._activeExtMap();
+    if (active.size) return active.has(ext);
+    // Sin instancias corriendo (o lsp mockeado en tests): fallback clásico.
+    return this._supportedExts.includes(ext);
+  }
+
+  // ── Editor tracker ───────────────────────────────────────────────────────
+
+  getOpenFiles() {
+    const extra = this._extraOpenFiles ? this._extraOpenFiles() : [];
+    const set = new Set(this._openInEditor);
+    for (const f of extra || []) {
+      try {
+        set.add(path.resolve(f));
+      } catch {}
+    }
+    return Array.from(set);
+  }
+
+  getFocusedFile() {
+    return this._focusedFile;
+  }
+
+  /** Errores (severidad 1) del último scan de un archivo — verificación post-parche. */
+  getErrorsFor(absPath) {
+    return this._lastErrors.get(path.resolve(absPath)) || [];
+  }
+
+  /**
+   * P4: scan inmediato con debounce. Se engancha a `os:app-changed` para que
+   * un cambio de foco dispare la detección en segundos en vez de esperar el
+   * próximo tick de 30s.
+   * @param {{ debounceMs?: number }} [opts]
+   */
+  scanNow({ debounceMs = 3000 } = {}) {
+    const now = Date.now();
+    if (now - this._lastForcedScan < debounceMs) return;
+    this._lastForcedScan = now;
+    if (!this._running || this._polling) return;
+    Promise.resolve(this.poll()).catch(() => {});
+  }
+
+  /**
+   * Errores recientes del workspace (último scan), priorizando el archivo
+   * enfocado y los archivos abiertos en el editor. Para la sección de
+   * diagnósticos del system prompt — lectura barata: cache del watcher,
+   * sin pulls LSP.
+   * @param {{ limit?: number }} [opts]
+   * @returns {Array<{ filePath: string, language: string, line: number, character: number, message: string, source: string|null }>}
+   */
+  getRecentErrors({ limit = 5 } = {}) {
+    const out = [];
+    const priority = [...(this._focusedFile ? [this._focusedFile] : []), ...this.getOpenFiles()];
+    const files = [...new Set(priority)].filter((f) => this._lastErrors.has(f));
+    if (files.length === 0) {
+      for (const f of this._lastErrors.keys()) files.push(f);
+    }
+    for (const f of files) {
+      for (const err of this._lastErrors.get(f) || []) {
+        if (out.length >= limit) return out;
+        out.push({
+          filePath: f,
+          language: this._languageFor(f),
+          line: err.line ?? -1,
+          character: err.character ?? -1,
+          message: String(err.message || '').slice(0, 160),
+          source: err.source || null,
+        });
+      }
+    }
+    return out;
+  }
+
+  getStats() {
+    return {
+      running: this._running,
+      workspace: this._workspace,
+      focused: this._focusedFile,
+      openFiles: Array.from(this._openInEditor),
+      signals: this._signals.size,
+      emitted: this._emitted,
+      lastError: this._lastError,
+    };
+  }
+}
+
+module.exports = { LSPErrorWatcher, SEVERITY_ERROR };

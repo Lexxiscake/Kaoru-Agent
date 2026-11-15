@@ -1,0 +1,58 @@
+// state.js — estado mutable compartido del núcleo (Core). Centraliza las
+// variables de módulo que antes vivían en Core.js para que cada submódulo de
+// `core/core/` las comparta sin dependencias circulares.
+
+const state = {
+  graph: null,
+  grounding: null,
+  session: null,
+  updater: null,
+  observationBridge: null,
+  memorySleepCycle: null,
+  osSensor: null,
+  proactive: null,
+  behavior: null,
+  planner: null,
+  bridge: null,
+  bus: null,
+  app: null,
+  configPath: null,
+  detector: null,
+  openclawProcess: null,
+  openclawStarting: false,
+  openclawWorkspace: null,
+  taskDetector: null,
+  toolRegistry: null,
+  lspManager: null,
+  gitWatcher: null,
+  systemWatcher: null,
+  titleWatcher: null,
+  clipboardWatcher: null,
+  eventsWatcher: null,
+  proposalStore: null,
+  proactiveExecutor: null,
+  lspErrorWatcher: null,
+  symbolIndex: null,
+  repositoryIntelligence: null,
+  telemetry: null,
+  activeWorkspace: null,
+  activeTerminalId: null,
+  activeModel3Path: null, // ruta del model3.json activo (lo sincroniza window-model-handlers)
+  onProposalResult: null,
+  proposalExecutedUnsub: null,
+  lastProposal: null, // { id, type } de la última propuesta emitida (debug/testing)
+  pruneTimer: null,
+  pruneInitTimer: null,
+  openclawKillTimer: null,
+  openclawCheckTimer: null,
+  initiativeUnsub: null,
+  initialized: false,
+  onInitiative: null,
+  skillManager: null,
+  pluginManager: null,
+  permissionManager: null,
+  goalGovernor: null,
+  learning: /** @type {{skillStats:(opts:any)=>any}|null} */ (null),
+};
+
+module.exports = state;
