@@ -7,7 +7,7 @@ const { marked } = require('marked');
 
 const root = path.resolve(__dirname, '../docs/web');
 const languages = ['es', 'en', 'ja'];
-const repo = 'https://github.com/Dregxmoon/Kaoru-Agent';
+const repo = 'https://github.com/Lexxiscake/Kaoru-Agent';
 const appVersion = require('../package.json').version;
 const releaseBase = `${repo}/releases/download/v${appVersion}/`;
 const releaseFiles = {
@@ -79,7 +79,7 @@ function requirements(c) {
         `<article class="requirements-card fade-up"><h3>${escape(mode.title)}</h3><p>${escape(mode.description)}</p><table><thead><tr><th scope="col">${escape(resource)}</th><th scope="col">${escape(minimum)}</th><th scope="col">${escape(recommended)}</th></tr></thead><tbody>${mode.rows.map(([name, min, rec]) => `<tr><th scope="row">${escape(name)}</th><td>${escape(min)}</td><td>${escape(rec)}</td></tr>`).join('')}</tbody></table><p class="requirements-gpu">${escape(mode.gpu)}</p></article>`
     )
     .join('');
-  return `<section id="requirements" class="section"><div class="container"><div class="section-heading fade-up"><span class="eyebrow">KAORU / ${escape(c.nav[3])}</span><h2>${escape(c.requirementsTitle)}</h2><p>${escape(c.requirementsIntro)}</p></div><div class="grid-2 requirements-grid">${modes}</div><p class="requirements-caveat">${escape(c.requirementsCaveat)}</p><p class="section-link"><a href="${repo}/blob/produccion/docs/requisitos.md">${escape(c.requirementsDetail)} <span aria-hidden="true">↗</span></a></p></div></section>`;
+  return `<section id="requirements" class="section"><div class="container"><div class="section-heading fade-up"><span class="eyebrow">KAORU / ${escape(c.nav[3])}</span><h2>${escape(c.requirementsTitle)}</h2><p>${escape(c.requirementsIntro)}</p></div><div class="grid-2 requirements-grid">${modes}</div><p class="requirements-caveat">${escape(c.requirementsCaveat)}</p><p class="section-link"><a href="${repo}/blob/main/docs/requisitos.md">${escape(c.requirementsDetail)} <span aria-hidden="true">↗</span></a></p></div></section>`;
 }
 
 function home(c) {
@@ -93,7 +93,7 @@ function home(c) {
   <section id="security" class="section"><div class="container"><div class="section-heading fade-up"><span class="eyebrow">03 / KAORU</span><h2>${c.securityTitle}</h2><p>${c.securityIntro}</p></div><div class="grid-2">${cards(c.security, 'security-card')}</div><p class="section-link"><a href="privacy.html">${c.privacyLink} <span aria-hidden="true">↗</span></a></p></div></section>
   <section class="section sec-alt" id="users"><div class="container"><div class="section-heading fade-up"><span class="eyebrow">04 / KAORU</span><h2>${c.audienceTitle}</h2></div><div class="grid-3">${cards(c.audience)}</div></div></section>
   <section class="section" id="screenshots"><div class="container"><div class="section-heading fade-up"><h2>${c.galleryTitle}</h2><p>${c.galleryIntro}</p></div><div class="grid-2 gallery">${['03-chat-bienvenida.png', '07-propuesta.png'].map((file, i) => `<figure class="fade-up"><img src="${prefix}assets/${file}" alt="${c.gallery[i]}" loading="lazy"><figcaption>${c.gallery[i]}</figcaption></figure>`).join('')}</div></div></section>
-  <section class="section sec-dark" id="quickstart"><div class="container quickstart fade-up"><span class="eyebrow">KAORU / ${c.pages.guide}</span><h2>${c.quickTitle}</h2><p>${c.quickIntro}</p><ol>${c.quickSteps.map((x) => `<li>${x}</li>`).join('')}</ol><div class="hero-btns"><a class="btn-dark" href="guide.html">${c.start} <span aria-hidden="true">↗</span></a><a class="btn-outline" href="${repo}/blob/produccion/docs/README.md">${c.docs}</a></div></div></section>`;
+  <section class="section sec-dark" id="quickstart"><div class="container quickstart fade-up"><span class="eyebrow">KAORU / ${c.pages.guide}</span><h2>${c.quickTitle}</h2><p>${c.quickIntro}</p><ol>${c.quickSteps.map((x) => `<li>${x}</li>`).join('')}</ol><div class="hero-btns"><a class="btn-dark" href="guide.html">${c.start} <span aria-hidden="true">↗</span></a><a class="btn-outline" href="${repo}/blob/main/docs/README.md">${c.docs}</a></div></div></section>`;
 }
 
 const icons = {
@@ -127,7 +127,7 @@ function downloads(c) {
 function guide(c) {
   const manualHref = c.lang === 'es' ? 'manual.html' : '../manual.html';
   const toc = `<aside class="toc"><nav aria-label="${c.contents}"><strong>${c.contents}</strong>${c.guideSections.map(([id, title]) => `<a href="#${id}">${title}</a>`).join('')}</nav></aside>`;
-  return `<header class="page-heading container"><span class="eyebrow">KAORU / ${c.pages.guide}</span><h1>${c.pages.guide}</h1><p>${c.guideIntro}</p><p><a href="${manualHref}">${escape(c.manualLink)} →</a></p></header><div class="container document-layout">${toc}<article class="prose">${c.guideSections.map(([id, title, text], i) => `<section id="${id}"><h2>${i + 1}. ${title}</h2><p>${text}</p>${id === 'install' ? `${downloads(c)}<details class="source-install"><summary>${escape(c.sourceTitle)}</summary><div class="code-block"><div class="code-heading"><span>Git / npm</span><button type="button" class="copy-button" data-copy="install-commands" data-copied="${c.copied}" data-error="${c.copyError}">${c.copy}</button></div><pre><code id="install-commands">${escape(commands)}</code></pre></div><p class="copy-status" role="status" aria-live="polite"></p><p>${c.installNote}</p></details><p class="inline-links"><a href="${repo}/blob/produccion/README.md">${c.installDocs} ↗</a><a href="${repo}/blob/produccion/docs/requisitos.md">${c.requirementsLink} ↗</a></p>` : ''}</section>`).join('')}<p class="note"><a href="privacy.html">${c.pages.privacy}</a> · <a href="terms.html">${c.pages.terms}</a></p></article></div>`;
+  return `<header class="page-heading container"><span class="eyebrow">KAORU / ${c.pages.guide}</span><h1>${c.pages.guide}</h1><p>${c.guideIntro}</p><p><a href="${manualHref}">${escape(c.manualLink)} →</a></p></header><div class="container document-layout">${toc}<article class="prose">${c.guideSections.map(([id, title, text], i) => `<section id="${id}"><h2>${i + 1}. ${title}</h2><p>${text}</p>${id === 'install' ? `${downloads(c)}<details class="source-install"><summary>${escape(c.sourceTitle)}</summary><div class="code-block"><div class="code-heading"><span>Git / npm</span><button type="button" class="copy-button" data-copy="install-commands" data-copied="${c.copied}" data-error="${c.copyError}">${c.copy}</button></div><pre><code id="install-commands">${escape(commands)}</code></pre></div><p class="copy-status" role="status" aria-live="polite"></p><p>${c.installNote}</p></details><p class="inline-links"><a href="${repo}/blob/main/README.md">${c.installDocs} ↗</a><a href="${repo}/blob/main/docs/requisitos.md">${c.requirementsLink} ↗</a></p>` : ''}</section>`).join('')}<p class="note"><a href="privacy.html">${c.pages.privacy}</a> · <a href="terms.html">${c.pages.terms}</a></p></article></div>`;
 }
 
 function manual(c, source) {
@@ -140,8 +140,8 @@ function manual(c, source) {
   const renderer = new marked.Renderer();
   const destinations = {
     './web/privacy.html': 'privacy.html',
-    '../README.md': `${repo}/blob/produccion/README.md`,
-    './requisitos.md': `${repo}/blob/produccion/docs/requisitos.md`,
+    '../README.md': `${repo}/blob/main/README.md`,
+    './requisitos.md': `${repo}/blob/main/docs/requisitos.md`,
   };
   renderer.html = (raw) => escape(raw);
   renderer.image = (_href, _title, alt) => escape(alt);
