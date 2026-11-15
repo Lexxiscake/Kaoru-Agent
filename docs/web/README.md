@@ -36,7 +36,23 @@ bash tests/run-all.sh tests/test_website.js
 La prueba necesita Chromium de Playwright y permiso para abrir un servidor HTTP local. Comprueba
 las trece rutas, recursos, enlaces y anclas, idiomas, ausencia de desbordamiento, cambio de tema,
 navegación móvil, portapapeles, almacenamiento bloqueado, movimiento reducido y lectura sin JS.
-La web se sirve desde `docs/`; `docs/index.html` dirige a `web/index.html`.
+
+## Publicación en GitHub Pages
+
+El sitio es estático (HTML/CSS/JS generado) y está listo para servirse desde la carpeta `docs/` del repositorio: `docs/index.html` redirige a `web/index.html`.
+
+Configuración en GitHub (una vez por repositorio):
+
+1. Ve a **Settings → Pages** del repositorio.
+2. En **Build and deployment → Source**, selecciona **Deploy from a branch**.
+3. En **Branch**, elige `main` y la carpeta **`/docs`**.
+4. Guarda los cambios. GitHub publicará el sitio y mostrará la URL (normalmente `https://<usuario>.github.io/<repositorio>/`).
+
+Notas técnicas:
+
+- No se requiere workflow de Actions ni paso de build en GitHub: los archivos publicados son los ya versionados en `docs/` (incluye `docs/web/` y `docs/index.html`).
+- Si actualizas el contenido fuente, regenera y commitea el resultado antes de publicar: `node scripts/build-website.js`.
+- El sitio no usa Jekyll; si alguna vez se necesita desactivar su procesamiento, añade un archivo vacío `docs/.nojekyll` (no es necesario con la estructura actual).
 
 ## Alcance editorial
 
